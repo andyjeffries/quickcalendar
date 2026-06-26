@@ -24,6 +24,7 @@ Dismiss the overlay with Esc or click. Auto-dismiss is intentionally absent.
 
 import argparse
 import datetime as dt
+import fcntl
 import hashlib
 import json
 import os
@@ -1015,6 +1016,18 @@ def cmd_show(title, start_iso, description="", location="", end_iso=""):
             f"{layer_lib}:{env['LD_PRELOAD']}" if env.get("LD_PRELOAD") else layer_lib
         )
         os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+    # Queue overlapping alerts instead of stacking them. Each `show` is its own
+    # process (see NON_UNIQUE below), so two events firing at once would draw two
+    # semi-transparent fullscreen overlays on top of each other — compounding to
+    # near-opaque black and needing two dismissals. Serialise them with a single
+    # blocking lock: a process holds the lock for as long as its window is up, so
+    # any later alert blocks here until the current one is dismissed, then shows.
+    # Held for the process lifetime; released automatically on exit even if we
+    # crash. _overlay_lock is kept referenced so its fd isn't GC'd/closed early.
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    _overlay_lock = open(STATE_DIR / "overlay.lock", "w")
+    fcntl.flock(_overlay_lock, fcntl.LOCK_EX)
 
     import gi
     gi.require_version("Gtk", "4.0")
