@@ -125,6 +125,30 @@ The sync agent caches each feed under `~/.local/state/quickcalendar/` (5-minute
 freshness, falls back to stale cache if a fetch fails) and records fired events
 in `fired.json` so an alert never double-fires across ticks.
 
+## Compositor notes (optional)
+
+quickcalendar needs **no special compositor configuration**. The fullscreen
+event alert uses the `wlr-layer-shell` overlay layer (it sits above everything
+on its own), and the viewer is an ordinary floating window — both just work on
+any `wlr-layer-shell` compositor.
+
+If you're on Hyprland and want to bind a key or pin the viewer's placement,
+here are two optional niceties:
+
+```conf
+# Open the week view on a keybind
+bind = SUPER, C, exec, quickcalendar
+
+# Float + size the viewer. IMPORTANT: match on the title too — the class
+# `org.quickshell` is shared by every Quickshell surface (your bar, etc.),
+# so a class-only rule would also catch unrelated windows.
+windowrulev2 = float, class:^(org\.quickshell)$, title:^(Calendar View)$
+windowrulev2 = size 1180 780, class:^(org\.quickshell)$, title:^(Calendar View)$
+```
+
+(Window-rule syntax shifts between Hyprland versions — adjust `windowrulev2` /
+`match:` to match yours.)
+
 ## Uninstall
 
 ```sh
