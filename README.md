@@ -119,7 +119,7 @@ file present, the defaults below apply.
 | --- | --- | --- |
 | `fullscreen_alerts` | `true` | Raise the fullscreen overlay when an event starts. Set `false` to turn it off entirely. |
 | `reminders` | `true` | Fire pre-event VALARM desktop notifications (mako popups). Set `false` to silence them. |
-| `alert_lead_time` | `0` | Raise the overlay this long *before* an event starts, e.g. `5m`. |
+| `alert_lead_time` | `0` | Raise the overlay this long *before* an event starts, e.g. `5m`. With the default `0`, the overlay still appears within ~1 minute of the start (the sync runs each minute). |
 | `alert_auto_dismiss` | `0` | Close the overlay this long after it appears, e.g. `2m`. `0` = stay until the event ends or you dismiss it. |
 | `quiet_hours` | off | Suppress the overlay during a local time range, e.g. `22:00-07:00` (wraps past midnight). Reminders still fire. |
 | `cache_max_age` | `5m` | How long a fetched ICS feed is reused before re-fetching. |

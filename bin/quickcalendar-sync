@@ -925,9 +925,15 @@ def prune_state(state, now):
 
 def cmd_check():
     now = dt.datetime.now(dt.timezone.utc).astimezone()
-    # Floor to the current minute, then look ahead two minutes.
-    window_lo = now.replace(second=0, microsecond=0)
-    window_hi = window_lo + dt.timedelta(minutes=2)
+    # Detection window straddles the current minute rather than looking two
+    # minutes ahead. One minute back catches a single missed timer tick (system
+    # busy, resume from suspend) — the event fires slightly late instead of not
+    # at all — while only looking one minute forward keeps the overlay from
+    # appearing well before the event actually starts. Dedup state (2-day TTL,
+    # see prune_state) stops anything firing twice across overlapping ticks.
+    this_minute = now.replace(second=0, microsecond=0)
+    window_lo = this_minute - dt.timedelta(minutes=1)
+    window_hi = this_minute + dt.timedelta(minutes=1)
 
     state = prune_state(load_state(), now)
     fired = []
