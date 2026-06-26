@@ -19,6 +19,12 @@ Source of truth:
   Supports iCloud, Google Calendar, or any public/private ICS feed.
   Lines starting with # are comments. Blank lines are ignored.
 
+Settings (optional):
+  ~/.config/quickcalendar/calendars.conf — global `key = value` settings:
+  fullscreen_alerts, reminders, alert_lead_time, alert_auto_dismiss,
+  quiet_hours, cache_max_age, max_alert_length (see load_settings). Any key
+  also works as a `# key: value` comment in calendars.txt.
+
 Dismiss the overlay with Esc or click. Auto-dismiss is intentionally absent.
 """
 
@@ -48,6 +54,7 @@ except ImportError:
 HOME = Path.home()
 CONFIG_DIR = HOME / ".config" / "quickcalendar"
 CALENDARS_FILE = CONFIG_DIR / "calendars.txt"
+SETTINGS_FILE = CONFIG_DIR / "calendars.conf"
 STATE_DIR = HOME / ".local" / "state" / "quickcalendar"
 STATE_FILE = STATE_DIR / "fired.json"
 CACHE_DIR = STATE_DIR / "cache"
@@ -94,6 +101,152 @@ def _is_truthy(v):
     if v is None:
         return False
     return str(v).strip().lower() in ("true", "yes", "1", "on", "")
+
+
+# Global (not per-calendar) settings. These may live in a dedicated
+# calendars.conf or, for convenience, on a `# key: value` line in calendars.txt.
+# Each canonical key has a value type and a tuple of accepted aliases.
+_SETTING_SPECS = {
+    # canonical key        type         aliases
+    "fullscreen_alerts": ("bool",     ("fullscreen_alerts", "fullscreen_alert",
+                                        "fullscreen", "alerts", "overlay")),
+    "reminders":         ("bool",     ("reminders", "reminder", "notifications",
+                                        "notify")),
+    "alert_lead_time":   ("duration", ("alert_lead_time", "lead_time",
+                                        "alert_advance", "alert_early")),
+    "alert_auto_dismiss":("duration", ("alert_auto_dismiss", "auto_dismiss",
+                                        "auto_close", "alert_timeout")),
+    "quiet_hours":       ("quiet",    ("quiet_hours", "quiet", "do_not_disturb",
+                                        "dnd")),
+    "cache_max_age":     ("duration", ("cache_max_age", "cache_ttl", "cache_age",
+                                        "refresh_interval")),
+    "max_alert_length":  ("int",      ("max_alert_length", "max_desc_length",
+                                        "max_description", "alert_length")),
+}
+
+_SETTING_TYPES = {k: spec[0] for k, spec in _SETTING_SPECS.items()}
+_SETTING_ALIASES = {alias: k for k, spec in _SETTING_SPECS.items()
+                    for alias in spec[1]}
+
+_SETTING_DEFAULTS = {
+    "fullscreen_alerts":  True,
+    "reminders":          True,
+    "alert_lead_time":    0,            # seconds before start to raise the overlay
+    "alert_auto_dismiss": 0,            # 0 → dismiss at event end (default)
+    "quiet_hours":        None,         # (start_min, end_min) or None
+    "cache_max_age":      CACHE_MAX_AGE,
+    "max_alert_length":   900,          # characters of description shown
+}
+
+
+def _parse_duration_setting(v):
+    """'90'/'90s' → 90, '5m' → 300, '2h' → 7200, '1d' → 86400 (seconds).
+    'off'/'false'/'no'/'0'/'' → 0. Returns None if unparseable (value ignored)."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("", "off", "false", "no", "none", "never"):
+        return 0
+    m = re.fullmatch(r"(\d+)\s*([smhd]?)", s)
+    if not m:
+        return None
+    return int(m.group(1)) * {"": 1, "s": 1, "m": 60, "h": 3600, "d": 86400}[m.group(2)]
+
+
+def _parse_quiet_hours(v):
+    """'22:00-07:00' → (1320, 420) minutes-from-midnight (wraps past midnight).
+    Empty/off/garbage → None (feature disabled)."""
+    if v is None:
+        return None
+    s = str(v).strip().lower()
+    if s in ("", "off", "none", "false", "no"):
+        return None
+    m = re.fullmatch(r"(\d{1,2}):(\d{2})\s*[-–]\s*(\d{1,2}):(\d{2})", s)
+    if not m:
+        return None
+    h1, m1, h2, m2 = (int(x) for x in m.groups())
+    if not (h1 < 24 and m1 < 60 and h2 < 24 and m2 < 60):
+        return None
+    return (h1 * 60 + m1, h2 * 60 + m2)
+
+
+def _in_quiet_hours(now, quiet):
+    """True if local datetime `now` falls inside the (start_min, end_min) window."""
+    if not quiet:
+        return False
+    lo, hi = quiet
+    if lo == hi:
+        return False
+    cur = now.hour * 60 + now.minute
+    return (lo <= cur < hi) if lo < hi else (cur >= lo or cur < hi)
+
+
+def load_settings():
+    """Load global settings from calendars.conf, falling back to calendars.txt.
+
+    Format is `key: value` or `key = value`, with `#` comments. Recognised
+    keys (each with aliases) and their value types:
+
+        fullscreen_alerts = true|false   (alerts, fullscreen, overlay)
+            Raise the fullscreen overlay when an event starts. Default true.
+        reminders = true|false           (notifications, notify)
+            Fire pre-event VALARM desktop notifications. Default true.
+        alert_lead_time = 5m             (lead_time) — raise the overlay this
+            long *before* the event starts, not at start. Default 0.
+        alert_auto_dismiss = 2m          (auto_dismiss) — close the overlay
+            after this long. Default 0 = stay until event ends / dismissed.
+        quiet_hours = 22:00-07:00        (dnd) — suppress the overlay during
+            this local time range (reminders still fire). Default off.
+        cache_max_age = 5m               (cache_ttl) — how long a fetched ICS
+            feed is reused before re-fetching. Default 5m.
+        max_alert_length = 900           (max_desc_length) — characters of the
+            event description shown on the overlay. Default 900.
+
+    Durations accept a unit suffix (s/m/h/d); a bare number means seconds.
+
+    Lookup order (last writer wins): calendars.txt comment lines first, then
+    calendars.conf — so a dedicated calendars.conf overrides an inline
+    calendars.txt line if both set the same key.
+    """
+    settings = dict(_SETTING_DEFAULTS)
+
+    def _apply(body):
+        m = _TAG_RE.match(body)
+        if not m:
+            return
+        key = _SETTING_ALIASES.get(m.group(1).lower())
+        if not key:
+            return
+        typ, raw = _SETTING_TYPES[key], m.group(2)
+        if typ == "bool":
+            settings[key] = _is_truthy(raw)
+        elif typ == "duration":
+            d = _parse_duration_setting(raw)
+            if d is not None:
+                settings[key] = d
+        elif typ == "int":
+            try:
+                settings[key] = max(0, int(str(raw).strip()))
+            except ValueError:
+                pass
+        elif typ == "quiet":
+            settings[key] = _parse_quiet_hours(raw)
+
+    # calendars.txt may carry global settings on comment lines.
+    if CALENDARS_FILE.exists():
+        for raw in CALENDARS_FILE.read_text().splitlines():
+            line = raw.strip()
+            if line.startswith("#"):
+                _apply(line.lstrip("#").strip())
+
+    # A dedicated calendars.conf wins over an inline calendars.txt line.
+    if SETTINGS_FILE.exists():
+        for raw in SETTINGS_FILE.read_text().splitlines():
+            line = raw.strip()
+            if line and not line.startswith("#"):
+                _apply(line)
+
+    return settings
 
 
 def load_calendars():
@@ -145,6 +298,11 @@ def load_calendars():
                 if key:
                     pending[key] = m.group(2)
                     continue
+                # A global setting line (e.g. `# fullscreen_alerts: false`) —
+                # handled by load_settings(), not a per-calendar tag. Skip it so
+                # it doesn't get mistaken for a plain-comment label.
+                if m.group(1).lower() in _SETTING_ALIASES:
+                    continue
             # Not a recognised tag — keep as plain-comment fallback for the
             # label only. We deliberately don't overwrite an explicit name
             # tag that already came in for this URL.
@@ -185,14 +343,14 @@ def url_to_cache_path(url):
     return CACHE_DIR / f"{h}.ics"
 
 
-def fetch_ics(url, force_refresh=False):
+def fetch_ics(url, force_refresh=False, max_age=CACHE_MAX_AGE):
     """Fetch an ICS file, using cache if fresh enough."""
     cache_path = url_to_cache_path(url)
-    
+
     # Check cache freshness
     if not force_refresh and cache_path.exists():
         age = dt.datetime.now().timestamp() - cache_path.stat().st_mtime
-        if age < CACHE_MAX_AGE:
+        if age < max_age:
             return cache_path.read_text()
     
     # Fetch from URL
@@ -539,7 +697,7 @@ def _emit(uid, occ_start, master_or_ov, calendar, recurring=False):
     }
 
 
-def scan_events(window_lo, window_hi, force_refresh=False):
+def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_MAX_AGE):
     """Yield event dicts for occurrences in [window_lo, window_hi].
 
     Each dict has: uid, occ_key, summary, start, end, all_day, description,
@@ -559,7 +717,7 @@ def scan_events(window_lo, window_hi, force_refresh=False):
 
     for calendar in calendars:
         url = calendar["url"]
-        content = fetch_ics(url, force_refresh=force_refresh)
+        content = fetch_ics(url, force_refresh=force_refresh, max_age=cache_max_age)
         if not content:
             continue
 
@@ -774,6 +932,15 @@ def cmd_check():
     state = prune_state(load_state(), now)
     fired = []
 
+    settings = load_settings()
+    # When fullscreen alerts are off (or we're inside quiet hours) we still
+    # process VALARM reminders below — only the starting-now overlay is
+    # suppressed. `reminders` independently gates those notifications.
+    show_overlay = settings["fullscreen_alerts"] and not _in_quiet_hours(
+        now, settings["quiet_hours"])
+    # Raise the overlay this far ahead of the event's actual start time.
+    lead = dt.timedelta(seconds=settings["alert_lead_time"])
+
     # Single scan covers both:
     #   - main fullscreen overlay for events starting in [window_lo, window_hi]
     #   - VALARM-triggered notifications for events up to 30 days out whose
@@ -782,21 +949,22 @@ def cmd_check():
     # longer than that and the event is essentially in next month's view.
     alarm_lookahead_hi = window_hi + dt.timedelta(days=30)
 
-    for ev in scan_events(window_lo, alarm_lookahead_hi):
+    for ev in scan_events(window_lo, alarm_lookahead_hi,
+                          cache_max_age=settings["cache_max_age"]):
         uid, occ_key = ev["uid"], ev["occ_key"]
         title, start = ev["summary"], ev["start"]
         desc, loc = ev["description"], ev["location"]
 
-        # ---- main overlay (event starts now) ----
-        if window_lo <= start <= window_hi:
+        # ---- main overlay (event starts, minus any lead time) ----
+        if show_overlay and window_lo <= start - lead <= window_hi:
             key = (str(uid), occ_key)
             if key not in state:
                 _spawn_overlay(uid, occ_key, title, start, ev["end"], desc, loc)
                 state.add(key)
                 fired.append(("event", title, start.isoformat()))
 
-        # ---- VALARM reminders ----
-        for alarm in ev.get("alarms", []):
+        # ---- VALARM reminders (skipped entirely when reminders are off) ----
+        for alarm in (ev.get("alarms", []) if settings["reminders"] else []):
             trig = alarm.get("trigger")
             if trig is None:
                 continue
@@ -911,7 +1079,8 @@ def cmd_list(hours, hours_back=0, as_json=False):
     window_hi = now + dt.timedelta(hours=hours)
 
     events = sorted(
-        scan_events(window_lo, window_hi),
+        scan_events(window_lo, window_hi,
+                    cache_max_age=load_settings()["cache_max_age"]),
         key=lambda e: e["start"],
     )
 
@@ -1029,6 +1198,8 @@ def cmd_show(title, start_iso, description="", location="", end_iso=""):
     _overlay_lock = open(STATE_DIR / "overlay.lock", "w")
     fcntl.flock(_overlay_lock, fcntl.LOCK_EX)
 
+    settings = load_settings()
+
     import gi
     gi.require_version("Gtk", "4.0")
     gi.require_version("Gtk4LayerShell", "1.0")
@@ -1130,7 +1301,8 @@ def cmd_show(title, start_iso, description="", location="", end_iso=""):
             loc_label.connect("activate-link", on_link)
             box.append(loc_label)
 
-        trimmed_desc = _trim_description(description)
+        trimmed_desc = _trim_description(
+            description, max_chars=settings["max_alert_length"])
         if trimmed_desc:
             d = Gtk.Label()
             d.set_markup(linkify_for_pango(trimmed_desc))
@@ -1164,17 +1336,23 @@ def cmd_show(title, start_iso, description="", location="", end_iso=""):
 
         win.present()
 
-        # Auto-dismiss once the event would have ended, so an alert left
-        # undismissed (e.g. overnight) isn't still on-screen the next morning.
-        # Clamped: shown for at least MIN (visible even if it already ended by
-        # the time we fire) and at most MAX (a mis-parsed or all-day duration
-        # shouldn't keep a fullscreen overlay up for the rest of the day).
-        MIN_SECONDS = 60
-        MAX_SECONDS = 6 * 3600
-        end = end_dt or (start_dt + dt.timedelta(hours=1))
-        now = dt.datetime.now(dt.timezone.utc).astimezone()
-        remaining = (end.astimezone() - now).total_seconds()
-        timeout = int(max(MIN_SECONDS, min(MAX_SECONDS, remaining)))
+        # Auto-dismiss. With `alert_auto_dismiss` set, the overlay closes a
+        # fixed time after it appears (for people who step away from the desk).
+        # Otherwise it stays until the event would have ended, so an alert left
+        # undismissed (e.g. overnight) isn't still on-screen the next morning —
+        # clamped to at least MIN (visible even if it already ended by the time
+        # we fire) and at most MAX (a mis-parsed or all-day duration shouldn't
+        # keep a fullscreen overlay up for the rest of the day).
+        auto = settings["alert_auto_dismiss"]
+        if auto > 0:
+            timeout = max(5, auto)
+        else:
+            MIN_SECONDS = 60
+            MAX_SECONDS = 6 * 3600
+            end = end_dt or (start_dt + dt.timedelta(hours=1))
+            now = dt.datetime.now(dt.timezone.utc).astimezone()
+            remaining = (end.astimezone() - now).total_seconds()
+            timeout = int(max(MIN_SECONDS, min(MAX_SECONDS, remaining)))
         GLib.timeout_add_seconds(
             timeout, lambda: (win.close(), GLib.SOURCE_REMOVE)[1]
         )

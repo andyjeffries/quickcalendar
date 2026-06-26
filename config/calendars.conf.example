@@ -1,0 +1,60 @@
+# quickcalendar — global settings (optional).
+#
+# Copy this file to ~/.config/quickcalendar/calendars.conf to change behaviour
+# that isn't tied to a single feed. Everything here is optional; with no file
+# present quickcalendar uses the defaults shown below.
+#
+# Format: `key = value` (or `key: value`). Lines starting with # are comments.
+# Durations take a unit suffix — s/m/h/d — and a bare number means seconds.
+#
+# Every key can also be set inline in calendars.txt as a comment line, e.g.
+#   # fullscreen_alerts: false
+# A calendars.conf entry wins if you set the same key in both places.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Alerts
+# ─────────────────────────────────────────────────────────────────────────
+#   fullscreen_alerts = true     When an event starts, a fullscreen overlay
+#                                takes over the screen until dismissed. Set
+#                                false to turn the overlay off entirely.
+#                                Aliases: alerts, fullscreen, overlay.
+#
+#   reminders = true             Fire pre-event VALARM desktop notifications
+#                                (mako popups). Set false to silence them.
+#                                The overlay is independent of this.
+#                                Aliases: notifications, notify.
+#
+#   alert_lead_time = 0          Raise the overlay this long *before* an event
+#                                starts instead of at the start moment.
+#                                e.g. `alert_lead_time = 5m`. Alias: lead_time.
+#
+#   alert_auto_dismiss = 0       Close the overlay this long after it appears
+#                                (handy if you step away). 0 = stay up until
+#                                the event ends or you dismiss it.
+#                                e.g. `alert_auto_dismiss = 2m`.
+#                                Alias: auto_dismiss.
+#
+#   quiet_hours = off            Suppress the fullscreen overlay during a local
+#                                time range (reminders still fire). Wraps past
+#                                midnight. e.g. `quiet_hours = 22:00-07:00`.
+#                                Alias: dnd.
+#
+#   max_alert_length = 900       Maximum characters of an event description
+#                                shown on the overlay. Alias: max_desc_length.
+#
+# ─────────────────────────────────────────────────────────────────────────
+# Fetching
+# ─────────────────────────────────────────────────────────────────────────
+#   cache_max_age = 5m           How long a fetched ICS feed is reused before
+#                                re-fetching. Lower = fresher but more network
+#                                traffic. e.g. `cache_max_age = 1m`.
+#                                Alias: cache_ttl.
+# ─────────────────────────────────────────────────────────────────────────
+
+# fullscreen_alerts = false
+# reminders = false
+# alert_lead_time = 5m
+# alert_auto_dismiss = 2m
+# quiet_hours = 22:00-07:00
+# cache_max_age = 5m
+# max_alert_length = 900

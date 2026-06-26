@@ -108,6 +108,36 @@ Getting a secret ICS URL:
 - **iCloud** → Calendar app → right-click a calendar → Share → *Public Calendar*
   → copy the `webcal://` URL (quickcalendar rewrites it to `https://`)
 
+## Settings
+
+Global behaviour (not tied to a single feed) lives in an optional
+`~/.config/quickcalendar/calendars.conf` — `key = value` lines, `#` comments.
+See [`config/calendars.conf.example`](config/calendars.conf.example). With no
+file present, the defaults below apply.
+
+| Key | Default | What it does |
+| --- | --- | --- |
+| `fullscreen_alerts` | `true` | Raise the fullscreen overlay when an event starts. Set `false` to turn it off entirely. |
+| `reminders` | `true` | Fire pre-event VALARM desktop notifications (mako popups). Set `false` to silence them. |
+| `alert_lead_time` | `0` | Raise the overlay this long *before* an event starts, e.g. `5m`. |
+| `alert_auto_dismiss` | `0` | Close the overlay this long after it appears, e.g. `2m`. `0` = stay until the event ends or you dismiss it. |
+| `quiet_hours` | off | Suppress the overlay during a local time range, e.g. `22:00-07:00` (wraps past midnight). Reminders still fire. |
+| `cache_max_age` | `5m` | How long a fetched ICS feed is reused before re-fetching. |
+| `max_alert_length` | `900` | Characters of an event description shown on the overlay. |
+
+Durations take a unit suffix (`s`/`m`/`h`/`d`); a bare number means seconds.
+Most keys have aliases (`alerts`, `dnd`, `auto_dismiss`, …) — see the example
+file. Example: turn the takeover overlay off but keep notifications:
+
+```ini
+# ~/.config/quickcalendar/calendars.conf
+fullscreen_alerts = false
+```
+
+Every key can also be set inline in `calendars.txt` as a comment, e.g.
+`# fullscreen_alerts: false`; a `calendars.conf` entry wins if both set the
+same key. Changes take effect on the next minute's sync — no restart needed.
+
 ## How it works
 
 ```
@@ -116,6 +146,7 @@ Getting a secret ICS URL:
    quickcalendar-sync.timer ──► quickcalendar-sync check  (every minute)
                                   │   fetch + cache ICS, expand RRULE
                                   ├─► event starting now? ─► fullscreen overlay
+                                  │   (unless disabled in calendars.conf)
                                   └─► VALARM due?         ─► notify-send reminder
 
    quickcalendar (viewer) ──► quickcalendar-sync list --json ─► week grid
