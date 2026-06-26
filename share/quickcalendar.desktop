@@ -1,0 +1,11 @@
+[Desktop Entry]
+Type=Application
+Name=Quickcalendar
+GenericName=Calendar
+Comment=Week view of ICS feeds configured in ~/.config/quickcalendar/calendars.txt
+Exec=@BINDIR@/quickcalendar
+Icon=x-office-calendar
+Terminal=false
+Categories=Office;Calendar;
+Keywords=calendar;week;ics;events;
+StartupWMClass=org.quickshell

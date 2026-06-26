@@ -1,0 +1,1222 @@
+#!/usr/bin/env python3
+"""quickcalendar-sync — fullscreen overlay when a calendar event starts.
+
+Subcommands:
+  check                 scan calendar; spawn an alert for any event whose
+                        start time falls within the recent window. Run from
+                        the quickcalendar-sync.timer user-unit (every minute).
+  show TITLE START_ISO  open the fullscreen alert for one event. Used
+                        internally; check() forks itself in this mode.
+  list [HOURS] [--back HOURS] [--json]
+                        print occurrences in the window; default = next 24h.
+                        --json emits {calendars, events} for tools like
+                        calendarview.
+  calendars [--json]    list configured calendars (label/ICS URL/add URL).
+  refresh               force re-fetch of all calendar URLs (clears cache).
+
+Source of truth:
+  ~/.config/quickcalendar/calendars.txt — one ICS URL per line.
+  Supports iCloud, Google Calendar, or any public/private ICS feed.
+  Lines starting with # are comments. Blank lines are ignored.
+
+Dismiss the overlay with Esc or click. Auto-dismiss is intentionally absent.
+"""
+
+import argparse
+import datetime as dt
+import hashlib
+import json
+import os
+import re
+import subprocess
+import sys
+import urllib.request
+import urllib.error
+from pathlib import Path
+from zoneinfo import ZoneInfo
+
+try:
+    from dateutil.rrule import rrulestr
+except ImportError:
+    sys.exit(
+        "quickcalendar-sync: python-dateutil missing — "
+        "`sudo pacman -S --needed python-dateutil`"
+    )
+
+
+HOME = Path.home()
+CONFIG_DIR = HOME / ".config" / "quickcalendar"
+CALENDARS_FILE = CONFIG_DIR / "calendars.txt"
+STATE_DIR = HOME / ".local" / "state" / "quickcalendar"
+STATE_FILE = STATE_DIR / "fired.json"
+CACHE_DIR = STATE_DIR / "cache"
+
+# How often to re-fetch ICS files (in seconds). The check runs every minute,
+# but we don't want to hammer remote servers that often.
+CACHE_MAX_AGE = 300  # 5 minutes
+
+
+# ---------- ICS fetching and caching ----------
+
+def load_calendar_urls():
+    """Load ICS URLs from the config file."""
+    return [c["url"] for c in load_calendars()]
+
+
+_TAG_RE = re.compile(r'^([a-zA-Z_]+)\s*[:=]\s*(.+?)\s*$')
+
+_TAG_ALIASES = {
+    "name":           "label",
+    "label":          "label",
+    "title":          "label",
+    "colour":         "color",
+    "color":          "color",
+    "add_event_url":  "add_url",
+    "add_url":        "add_url",
+    "create_url":     "add_url",
+    "new_event_url":  "add_url",
+    # Group several calendars under one entry in the picker (e.g. iCloud has
+    # no per-calendar new-event URL, so two iCloud feeds with the same
+    # add_group + add_url collapse into one row).
+    "add_group":      "add_group",
+    "group":          "add_group",
+    # Read-only subscription — render events but hide from the new-event
+    # picker (e.g. a public F1 schedule you can't write to).
+    "readonly":       "readonly",
+    "read_only":      "readonly",
+    "view_only":      "readonly",
+}
+
+
+def _is_truthy(v):
+    """Loose truthiness for tag values: 'true'/'yes'/'1'/'on' → True, else falsy."""
+    if v is None:
+        return False
+    return str(v).strip().lower() in ("true", "yes", "1", "on", "")
+
+
+def load_calendars():
+    """Parse calendars.txt into [{label, url, add_url, color}, ...].
+
+    Each URL is preceded by zero or more `# ...` lines that act as metadata.
+    Recognised tags (case-insensitive, all start with `# `):
+
+        # name: My Calendar          (also: title, label)
+        # colour: #392840            (also: color)
+        # add_event_url: https://…   (also: add_url, create_url, new_event_url)
+        # add_group: iCloud          (also: group) — collapses calendars
+                                       sharing the same group + add_url into
+                                       one entry in calendarview's picker.
+        # readonly: true             (also: read_only, view_only) — render
+                                       events but hide from the picker.
+
+    Any other comment line is treated as a plain comment and used as a fallback
+    label (so old `# My Calendar` formatting still works).
+
+    A blank line resets all pending tags so they can't leak into a later URL.
+
+    Defaults when a tag is absent:
+        label    → most-recent plain comment, else "Calendar N"
+        add_url  → inferred from the ICS host (Google / iCloud), else the ICS URL
+        color   → null (QML side falls back to a stable hash of the URL)
+    """
+    if not CALENDARS_FILE.exists():
+        return []
+    out = []
+    pending = {"label": None, "color": None, "add_url": None,
+               "add_group": None, "readonly": None}
+    fallback_label = None
+    n = 0
+    for raw in CALENDARS_FILE.read_text().splitlines():
+        line = raw.strip()
+        if not line:
+            pending = {"label": None, "color": None, "add_url": None,
+                       "add_group": None, "readonly": None}
+            fallback_label = None
+            continue
+        if line.startswith("#"):
+            body = line.lstrip("#").strip()
+            if not body:
+                continue
+            m = _TAG_RE.match(body)
+            if m:
+                key = _TAG_ALIASES.get(m.group(1).lower())
+                if key:
+                    pending[key] = m.group(2)
+                    continue
+            # Not a recognised tag — keep as plain-comment fallback for the
+            # label only. We deliberately don't overwrite an explicit name
+            # tag that already came in for this URL.
+            fallback_label = body
+            continue
+        # URL line
+        url = line
+        if url.startswith("webcal://"):
+            url = "https://" + url[9:]
+        n += 1
+        out.append({
+            "label": pending["label"] or fallback_label or f"Calendar {n}",
+            "url": url,
+            "add_url": pending["add_url"] or _add_url_for(url),
+            "color": pending["color"],
+            "add_group": pending["add_group"],
+            "readonly": _is_truthy(pending["readonly"]),
+        })
+        pending = {"label": None, "color": None, "add_url": None,
+                   "add_group": None, "readonly": None}
+        fallback_label = None
+    return out
+
+
+def _add_url_for(ics_url):
+    """Best-effort 'create new event' URL for a given ICS feed URL."""
+    u = ics_url.lower()
+    if "google.com" in u:
+        return "https://calendar.google.com/calendar/u/0/r/eventedit"
+    if "icloud.com" in u:
+        return "https://www.icloud.com/calendar/"
+    return ics_url
+
+
+def url_to_cache_path(url):
+    """Generate a cache filename for a URL."""
+    h = hashlib.sha256(url.encode()).hexdigest()[:16]
+    return CACHE_DIR / f"{h}.ics"
+
+
+def fetch_ics(url, force_refresh=False):
+    """Fetch an ICS file, using cache if fresh enough."""
+    cache_path = url_to_cache_path(url)
+    
+    # Check cache freshness
+    if not force_refresh and cache_path.exists():
+        age = dt.datetime.now().timestamp() - cache_path.stat().st_mtime
+        if age < CACHE_MAX_AGE:
+            return cache_path.read_text()
+    
+    # Fetch from URL
+    try:
+        req = urllib.request.Request(
+            url,
+            headers={"User-Agent": "quickcalendar/1.0"}
+        )
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            content = resp.read().decode("utf-8", errors="replace")
+        
+        # Cache it
+        CACHE_DIR.mkdir(parents=True, exist_ok=True)
+        cache_path.write_text(content)
+        return content
+    except (urllib.error.URLError, OSError) as e:
+        print(f"quickcalendar-sync: failed to fetch {url}: {e}", file=sys.stderr)
+        # Fall back to stale cache if available
+        if cache_path.exists():
+            print(f"quickcalendar-sync: using stale cache for {url}", file=sys.stderr)
+            return cache_path.read_text()
+        return None
+
+
+def clear_cache():
+    """Remove all cached ICS files."""
+    if CACHE_DIR.exists():
+        for f in CACHE_DIR.glob("*.ics"):
+            f.unlink()
+        print(f"Cleared cache: {CACHE_DIR}")
+
+
+# ---------- ICS parsing ----------
+
+def parse_ics_datetime(value, params, vtimezones):
+    """Parse an ICS datetime value into a tz-aware datetime.
+    
+    Args:
+        value: The datetime string (e.g., "20260522T160000" or "20260522")
+        params: Dict of parameters (e.g., {"TZID": "Europe/London"})
+        vtimezones: Dict mapping TZID to ZoneInfo (from VTIMEZONE blocks)
+    
+    Returns:
+        tz-aware datetime, or None if parsing fails
+    """
+    try:
+        # All-day event (DATE only)
+        if len(value) == 8:
+            d = dt.datetime.strptime(value, "%Y%m%d")
+            return d.replace(tzinfo=dt.timezone.utc)
+        
+        # Remove any trailing Z and note it
+        is_utc = value.endswith("Z")
+        value = value.rstrip("Z")
+        
+        # Parse the datetime
+        if "T" in value:
+            naive = dt.datetime.strptime(value, "%Y%m%dT%H%M%S")
+        else:
+            naive = dt.datetime.strptime(value, "%Y%m%d")
+        
+        # Apply timezone
+        if is_utc:
+            return naive.replace(tzinfo=dt.timezone.utc)
+        
+        tzid = params.get("TZID")
+        if tzid:
+            # Try vtimezones first (for custom definitions), then ZoneInfo
+            tz = vtimezones.get(tzid)
+            if not tz:
+                try:
+                    tz = ZoneInfo(tzid)
+                except Exception:
+                    tz = dt.timezone.utc
+            return naive.replace(tzinfo=tz)
+        
+        # Floating time - treat as local
+        try:
+            local_tz = ZoneInfo("localtime")
+        except Exception:
+            local_tz = dt.timezone.utc
+        return naive.replace(tzinfo=local_tz)
+    except Exception:
+        return None
+
+
+def parse_ics_line(line):
+    """Parse an ICS line into (name, params, value).
+    
+    Handles parameter parsing like: DTSTART;TZID=Europe/London:20260522T160000
+    """
+    # Split name;params from value
+    if ":" not in line:
+        return None, {}, line
+    
+    name_params, value = line.split(":", 1)
+    
+    # Split name from params
+    if ";" in name_params:
+        parts = name_params.split(";")
+        name = parts[0]
+        params = {}
+        for p in parts[1:]:
+            if "=" in p:
+                k, v = p.split("=", 1)
+                params[k.upper()] = v
+        return name.upper(), params, value
+    else:
+        return name_params.upper(), {}, value
+
+
+def unfold_ics(content):
+    """Unfold ICS continuation lines (lines starting with space/tab)."""
+    lines = []
+    for line in content.replace("\r\n", "\n").split("\n"):
+        if line.startswith((" ", "\t")) and lines:
+            lines[-1] += line[1:]
+        else:
+            lines.append(line)
+    return lines
+
+
+def extract_vtimezones(lines):
+    """Extract VTIMEZONE definitions and return a dict of TZID -> ZoneInfo."""
+    # For simplicity, we just try to use ZoneInfo with the TZID.
+    # Real VTIMEZONE parsing is complex and rarely needed since most
+    # ICS files use standard Olson timezone names.
+    timezones = {}
+    in_vtimezone = False
+    current_tzid = None
+    
+    for line in lines:
+        name, params, value = parse_ics_line(line)
+        if name == "BEGIN" and value == "VTIMEZONE":
+            in_vtimezone = True
+        elif name == "END" and value == "VTIMEZONE":
+            in_vtimezone = False
+            current_tzid = None
+        elif in_vtimezone and name == "TZID":
+            current_tzid = value
+            try:
+                timezones[value] = ZoneInfo(value)
+            except Exception:
+                pass
+    
+    return timezones
+
+
+_DURATION_RE = re.compile(
+    r'^(?P<sign>[+-]?)P'
+    r'(?:(?P<weeks>\d+)W)?'
+    r'(?:(?P<days>\d+)D)?'
+    r'(?:T(?:(?P<hours>\d+)H)?(?:(?P<minutes>\d+)M)?(?:(?P<seconds>\d+)S)?)?$'
+)
+
+
+def parse_duration(s):
+    """Parse an ICS DURATION value (RFC 5545 §3.3.6).
+
+    Examples: -PT15M (15 minutes before), -P1D (1 day before), PT0S (at start),
+    -PT2H30M. Returns a datetime.timedelta, or None if `s` doesn't parse.
+    """
+    m = _DURATION_RE.match(s.strip())
+    if not m:
+        return None
+    sign = -1 if m.group("sign") == "-" else 1
+    weights = {"weeks": 604800, "days": 86400, "hours": 3600,
+               "minutes": 60, "seconds": 1}
+    total = 0
+    for k, w in weights.items():
+        v = m.group(k)
+        if v:
+            total += int(v) * w
+    return dt.timedelta(seconds=sign * total)
+
+
+def parse_vevent(lines, vtimezones):
+    """Parse a VEVENT block into an event dict."""
+    event = {
+        "uid": None,
+        "summary": "(untitled)",
+        "dtstart": None,
+        "dtend": None,
+        "all_day": False,
+        "duration": None,
+        "rrule": None,
+        "exdates": [],
+        "description": "",
+        "location": "",
+        "meet_url": "",  # Google Meet / video conference URL when invite carries one
+        "status": "CONFIRMED",
+        "recurrence_id": None,
+        "alarms": [],   # list of {trigger: timedelta, action: str, description: str}
+    }
+
+    rrule_lines = []
+    in_valarm = False
+    current_alarm = None
+
+    for line in lines:
+        name, params, value = parse_ics_line(line)
+
+        # ---- VALARM sub-block ----
+        # Nested inside VEVENT in ICS; we collect TRIGGER (when to fire,
+        # relative to DTSTART) and the action. Absolute triggers (the rare
+        # VALUE=DATE-TIME form) are ignored — they're vanishingly rare in
+        # real feeds.
+        if name == "BEGIN" and value == "VALARM":
+            in_valarm = True
+            current_alarm = {"trigger": None, "action": "DISPLAY", "description": ""}
+            continue
+        if name == "END" and value == "VALARM":
+            in_valarm = False
+            if current_alarm and current_alarm["trigger"] is not None:
+                event["alarms"].append(current_alarm)
+            current_alarm = None
+            continue
+        if in_valarm:
+            if name == "TRIGGER" and params.get("VALUE") != "DATE-TIME":
+                current_alarm["trigger"] = parse_duration(value)
+            elif name == "ACTION":
+                current_alarm["action"] = value
+            elif name == "DESCRIPTION":
+                current_alarm["description"] = (
+                    value.replace("\\,", ",").replace("\\n", "\n")
+                )
+            continue
+
+        if name == "UID":
+            event["uid"] = value
+        elif name == "SUMMARY":
+            event["summary"] = value.replace("\\,", ",").replace("\\n", "\n").strip()
+        elif name == "DTSTART":
+            event["dtstart"] = parse_ics_datetime(value, params, vtimezones)
+            event["dtstart_params"] = params
+            if params.get("VALUE") == "DATE" or len(value) == 8:
+                event["all_day"] = True
+        elif name == "DTEND":
+            event["dtend"] = parse_ics_datetime(value, params, vtimezones)
+        elif name == "RRULE":
+            rrule_lines.append(f"RRULE:{value}")
+        elif name == "EXDATE":
+            exdt = parse_ics_datetime(value, params, vtimezones)
+            if exdt:
+                event["exdates"].append(exdt)
+        elif name == "DESCRIPTION":
+            event["description"] = value.replace("\\,", ",").replace("\\n", "\n")
+        elif name == "LOCATION":
+            event["location"] = value.replace("\\,", ",").replace("\\n", "\n")
+        elif name == "X-GOOGLE-CONFERENCE":
+            # Google Calendar puts the canonical Meet URL here; tooling that
+            # only reads DESCRIPTION misses it on stripped invites.
+            event["meet_url"] = value.strip()
+        elif name == "STATUS":
+            event["status"] = value
+        elif name == "RECURRENCE-ID":
+            event["recurrence_id"] = parse_ics_datetime(value, params, vtimezones)
+    
+    if rrule_lines:
+        event["rrule"] = "\n".join(rrule_lines)
+    
+    return event
+
+
+def parse_ics(content):
+    """Parse ICS content and yield event dicts."""
+    if not content:
+        return
+    
+    lines = unfold_ics(content)
+    vtimezones = extract_vtimezones(lines)
+    
+    in_vevent = False
+    vevent_lines = []
+    
+    for line in lines:
+        name, params, value = parse_ics_line(line)
+        
+        if name == "BEGIN" and value == "VEVENT":
+            in_vevent = True
+            vevent_lines = []
+        elif name == "END" and value == "VEVENT":
+            in_vevent = False
+            event = parse_vevent(vevent_lines, vtimezones)
+            if event["dtstart"] and event["status"] != "CANCELLED":
+                yield event
+        elif in_vevent:
+            vevent_lines.append(line)
+
+
+# ---------- event scanning ----------
+
+def _event_duration(ev):
+    """Best-effort duration for a parsed VEVENT, as a timedelta.
+
+    Falls back to 1 day for all-day events without DTEND, 1 hour otherwise.
+    """
+    if ev.get("dtend") and ev.get("dtstart"):
+        return ev["dtend"] - ev["dtstart"]
+    if ev.get("all_day"):
+        return dt.timedelta(days=1)
+    return dt.timedelta(hours=1)
+
+
+_MEET_RE = re.compile(
+    r'https?://(?:meet\.google\.com|zoom\.us|[a-z0-9-]+\.zoom\.us|teams\.microsoft\.com|teams\.live\.com)/[^\s<>"\'`]+'
+)
+
+
+def _extract_meet_url(master_or_ov):
+    """Best meeting-join URL for an event. X-GOOGLE-CONFERENCE wins; otherwise
+    pick the first matching URL out of DESCRIPTION (covers invites that only
+    embed it in the body text)."""
+    explicit = master_or_ov.get("meet_url") or ""
+    if explicit:
+        return explicit
+    m = _MEET_RE.search(master_or_ov.get("description", "") or "")
+    return m.group(0).rstrip(".,;:!?)]}") if m else ""
+
+
+def _emit(uid, occ_start, master_or_ov, calendar, recurring=False):
+    """Build the event dict yielded by scan_events for one occurrence.
+
+    `recurring` is the authoritative signal that this occurrence belongs to a
+    recurring series — it's True both for RRULE-expanded occurrences (where
+    master_or_ov is the master with rrule set) and for explicit overrides
+    (which carry only the override's own fields, no rrule). Caller decides.
+    """
+    duration = _event_duration(master_or_ov)
+    return {
+        "uid": str(uid),
+        "occ_key": int(occ_start.timestamp()),
+        "summary": master_or_ov["summary"],
+        "start": occ_start,
+        "end": occ_start + duration,
+        "all_day": master_or_ov.get("all_day", False),
+        "description": master_or_ov.get("description", ""),
+        "location": master_or_ov.get("location", ""),
+        "meet_url": _extract_meet_url(master_or_ov),
+        "recurring": recurring,
+        "calendar_url": calendar["url"],
+        "calendar_label": calendar["label"],
+        "alarms": master_or_ov.get("alarms", []),
+    }
+
+
+def scan_events(window_lo, window_hi, force_refresh=False):
+    """Yield event dicts for occurrences in [window_lo, window_hi].
+
+    Each dict has: uid, occ_key, summary, start, end, all_day, description,
+    location, calendar_url, calendar_label. occ_key is unique per occurrence
+    so dedupe state can distinguish repeats.
+    """
+    calendars = load_calendars()
+    if not calendars:
+        print("quickcalendar-sync: no calendars configured", file=sys.stderr)
+        print(f"  Add ICS URLs to {CALENDARS_FILE}", file=sys.stderr)
+        return
+
+    # Group events by UID *within each calendar*. UID collisions across
+    # different feeds (e.g. the same event invite in personal + family)
+    # would otherwise drop one copy.
+    events_by_uid = {}
+
+    for calendar in calendars:
+        url = calendar["url"]
+        content = fetch_ics(url, force_refresh=force_refresh)
+        if not content:
+            continue
+
+        for event in parse_ics(content):
+            key = (url, event["uid"] or id(event))
+            if key not in events_by_uid:
+                events_by_uid[key] = {"master": None, "overrides": [],
+                                       "calendar": calendar}
+
+            if event["recurrence_id"]:
+                events_by_uid[key]["overrides"].append(event)
+            else:
+                events_by_uid[key]["master"] = event
+
+    for (url, uid), group in events_by_uid.items():
+        master = group["master"]
+        overrides = group["overrides"]
+        calendar = group["calendar"]
+
+        # Build set of override times to skip in master expansion
+        override_times = set()
+        for ov in overrides:
+            if ov["recurrence_id"]:
+                override_times.add(ov["recurrence_id"].timestamp())
+
+        # Process overrides (they fire at their own time). Overrides only
+        # exist for recurring series, so flag accordingly even though the
+        # override itself doesn't carry an rrule.
+        for ov in overrides:
+            start = ov["dtstart"]
+            if start and window_lo <= start <= window_hi:
+                yield _emit(uid, start, ov, calendar, recurring=True)
+
+        # Process master event
+        if not master:
+            continue
+
+        start = master["dtstart"]
+        if not start:
+            continue
+
+        if master["rrule"]:
+            # Recurring event - expand occurrences
+            for occ in _expand_rrule(
+                master["rrule"], master.get("exdates", []),
+                start, window_lo, window_hi
+            ):
+                # Skip if there's an override for this time
+                if any(abs(occ.timestamp() - ov_t) < 60 for ov_t in override_times):
+                    continue
+                yield _emit(uid, occ, master, calendar, recurring=True)
+        else:
+            # Single event
+            if window_lo <= start <= window_hi:
+                yield _emit(uid, start, master, calendar)
+
+
+URL_RE = re.compile(r'https?://[^\s<>"\'`]+')
+
+
+def linkify_for_pango(text):
+    """Escape text for Pango markup and wrap any URLs in <a href=...> tags.
+
+    Trailing punctuation (.,;:!?)]}) is shaved off URLs so the typical
+    "see http://x.com." doesn't link the trailing period.
+    """
+    parts = []
+    last = 0
+    for m in URL_RE.finditer(text):
+        parts.append(_pango_escape(text[last:m.start()]))
+        url = m.group(0).rstrip('.,;:!?)]}')
+        esc = _pango_escape(url)
+        parts.append(f'<a href="{esc}">{esc}</a>')
+        last = m.start() + len(url)
+    parts.append(_pango_escape(text[last:]))
+    return "".join(parts)
+
+
+def _pango_escape(s):
+    return (s.replace("&", "&amp;")
+             .replace("<", "&lt;")
+             .replace(">", "&gt;")
+             .replace('"', "&quot;")
+             .replace("'", "&apos;"))
+
+
+def _trim_description(text, max_lines=14, max_chars=900):
+    """Collapse blank-line padding and cap length so the alert stays compact.
+    Google/Zoom invites pad descriptions with dozens of empty lines; we keep
+    the first chunk that's likely to contain the join URL.
+    """
+    if not text:
+        return ""
+    text = text.replace("\r\n", "\n").replace("\r", "\n").strip()
+    text = re.sub(r"\n{3,}", "\n\n", text)
+    lines = text.split("\n")
+    if len(lines) > max_lines:
+        lines = lines[:max_lines]
+        text = "\n".join(lines) + "\n…"
+    else:
+        text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[:max_chars].rstrip() + " …"
+    return text
+
+
+def _expand_rrule(rrule_str, exdates, dtstart, window_lo, window_hi):
+    """Expand a master event's recurrence rules to occurrences in [lo, hi].
+
+    Args:
+        rrule_str: The RRULE line(s) from the ICS (e.g., "RRULE:FREQ=WEEKLY;BYDAY=TH")
+        exdates: List of excluded datetime objects
+        dtstart: The master event's start datetime
+        window_lo, window_hi: The time window to expand into
+
+    Two-pass: first try with tz-aware DTSTART (correct semantics), and on
+    failure fall back to a naive-UTC pass that strips TZID= and trailing Z
+    so dateutil doesn't mix naive/aware datetimes.
+    """
+    if not rrule_str:
+        return []
+    
+    # Clean up the rrule string
+    block = rrule_str.strip()
+    dtstart_utc = dtstart.astimezone(dt.timezone.utc)
+
+    win_lo_utc = window_lo.astimezone(dt.timezone.utc)
+    win_hi_utc = window_hi.astimezone(dt.timezone.utc)
+
+    tz_name = None
+    if dtstart.tzinfo is not None and dtstart.tzinfo is not dt.timezone.utc:
+        name = getattr(dtstart.tzinfo, "key", None) or str(dtstart.tzinfo)
+        if name and name != "UTC":
+            tz_name = name
+
+    if tz_name:
+        local_dtstart = dtstart.strftime('%Y%m%dT%H%M%S')
+        dtstart_line = f"DTSTART;TZID={tz_name}:{local_dtstart}"
+    else:
+        dtstart_line = f"DTSTART:{dtstart_utc.strftime('%Y%m%dT%H%M%SZ')}"
+
+    # Add EXDATE lines
+    exdate_lines = ""
+    for exdt in exdates:
+        exdt_utc = exdt.astimezone(dt.timezone.utc)
+        exdate_lines += f"\nEXDATE:{exdt_utc.strftime('%Y%m%dT%H%M%SZ')}"
+
+    aware = f"{dtstart_line}\n{block}{exdate_lines}"
+    try:
+        rule = rrulestr(aware, forceset=True)
+        return list(rule.between(win_lo_utc, win_hi_utc, inc=True))
+    except (TypeError, ValueError):
+        pass
+
+    naive_block = re.sub(r';TZID=[^:]+:', ':', block)
+    naive_block = re.sub(r'(UNTIL=\d{8}(?:T\d{6})?)Z', r'\1', naive_block)
+    naive = f"DTSTART:{dtstart_utc.strftime('%Y%m%dT%H%M%S')}\n{naive_block}"
+    try:
+        rule = rrulestr(naive, forceset=True)
+        occs = rule.between(
+            win_lo_utc.replace(tzinfo=None),
+            win_hi_utc.replace(tzinfo=None),
+            inc=True,
+        )
+        return [o.replace(tzinfo=dt.timezone.utc) for o in occs]
+    except Exception:
+        return []
+
+
+# ---------- state (dedupe across ticks) ----------
+
+def load_state():
+    if not STATE_FILE.exists():
+        return set()
+    try:
+        return {tuple(x) for x in json.loads(STATE_FILE.read_text())}
+    except (json.JSONDecodeError, OSError):
+        return set()
+
+
+def save_state(state):
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps([list(x) for x in sorted(state)]))
+
+
+def prune_state(state, now):
+    # State keys come in two shapes:
+    #   ("<uid>", occ_key)                       — main overlay fired
+    #   ("<uid>", occ_key, "a", trigger_seconds) — reminder fired
+    # Drop anything whose occurrence timestamp is more than two days old.
+    cutoff = (now - dt.timedelta(days=2)).timestamp()
+    out = set()
+    for k in state:
+        if len(k) < 2:
+            continue
+        try:
+            if int(k[1]) > cutoff:
+                out.add(k)
+        except (ValueError, TypeError):
+            out.add(k)
+    return out
+
+
+# ---------- subcommands ----------
+
+def cmd_check():
+    now = dt.datetime.now(dt.timezone.utc).astimezone()
+    # Floor to the current minute, then look ahead two minutes.
+    window_lo = now.replace(second=0, microsecond=0)
+    window_hi = window_lo + dt.timedelta(minutes=2)
+
+    state = prune_state(load_state(), now)
+    fired = []
+
+    # Single scan covers both:
+    #   - main fullscreen overlay for events starting in [window_lo, window_hi]
+    #   - VALARM-triggered notifications for events up to 30 days out whose
+    #     reminder time falls in [window_lo, window_hi]
+    # 30 days is a generous upper bound on a sensible VALARM trigger; anything
+    # longer than that and the event is essentially in next month's view.
+    alarm_lookahead_hi = window_hi + dt.timedelta(days=30)
+
+    for ev in scan_events(window_lo, alarm_lookahead_hi):
+        uid, occ_key = ev["uid"], ev["occ_key"]
+        title, start = ev["summary"], ev["start"]
+        desc, loc = ev["description"], ev["location"]
+
+        # ---- main overlay (event starts now) ----
+        if window_lo <= start <= window_hi:
+            key = (str(uid), occ_key)
+            if key not in state:
+                _spawn_overlay(uid, occ_key, title, start, ev["end"], desc, loc)
+                state.add(key)
+                fired.append(("event", title, start.isoformat()))
+
+        # ---- VALARM reminders ----
+        for alarm in ev.get("alarms", []):
+            trig = alarm.get("trigger")
+            if trig is None:
+                continue
+            # Skip "at event start" alarms — already covered by the overlay
+            # so we don't double up with a mako popup for the same moment.
+            if abs(trig.total_seconds()) < 30:
+                continue
+            fire_time = start + trig
+            if not (window_lo <= fire_time <= window_hi):
+                continue
+            akey = (str(uid), occ_key, "a", int(trig.total_seconds()))
+            if akey in state:
+                continue
+            _spawn_reminder(title, start, loc, trig)
+            state.add(akey)
+            fired.append(("reminder", title, fire_time.isoformat()))
+
+    save_state(state)
+    if fired:
+        for kind, t, s in fired:
+            print(f"fired {kind}: {s}  {t}", file=sys.stderr)
+
+
+def _spawn_overlay(uid, occ_key, title, start, end, desc, loc):
+    """Launch the fullscreen overlay for an event that's starting now."""
+    log_path = STATE_DIR / "show.log"
+    STATE_DIR.mkdir(parents=True, exist_ok=True)
+    log = open(log_path, "ab")
+    log.write(f"\n=== {dt.datetime.now().isoformat()} {title!r} ===\n".encode())
+    log.flush()
+    # Spawn into a separate transient scope unit so the alert isn't part of
+    # quickcalendar-sync.service's cgroup — Type=oneshot otherwise SIGKILLs the
+    # whole cgroup when cmd_check exits, killing the alert before it can
+    # render.
+    scope_unit = f"quickcalendar-show-{hash(uid) & 0xFFFFFFFF:08x}-{occ_key}"
+    subprocess.Popen(
+        [
+            "systemd-run", "--user", "--scope", "--collect", "--quiet",
+            "--unit", scope_unit,
+            sys.argv[0], "show", title, start.isoformat(),
+            "--end", end.isoformat() if end else "",
+            "--desc", desc or "",
+            "--location", loc or "",
+        ],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=log,
+        stderr=log,
+    )
+
+
+def _humanize_offset(td):
+    """'-PT15M' → '15 minutes', '-P1D' → '1 day', '-PT1H30M' → '1h 30m'."""
+    s = int(abs(td.total_seconds()))
+    if s < 60:
+        return f"{s} sec"
+    if s < 3600:
+        m = s // 60
+        return f"{m} min" if m != 1 else "1 min"
+    if s < 86400:
+        h, rem = divmod(s, 3600)
+        m = rem // 60
+        if m == 0:
+            return f"{h} hr" if h != 1 else "1 hr"
+        return f"{h}h {m}m"
+    d, rem = divmod(s, 86400)
+    h = rem // 3600
+    if h == 0:
+        return f"{d} day" if d == 1 else f"{d} days"
+    return f"{d}d {h}h"
+
+
+def _spawn_reminder(title, start, location, trigger_td):
+    """Fire a desktop notification for a pre-event VALARM (mako displays it)."""
+    when = start.astimezone().strftime("%H:%M")
+    when_date = start.astimezone()
+    # If the event is tomorrow or later, include the day to avoid ambiguity.
+    today = dt.datetime.now(dt.timezone.utc).astimezone().date()
+    if when_date.date() != today:
+        when = when_date.strftime("%a %H:%M")
+
+    if trigger_td.total_seconds() < 0:
+        body_lead = f"in {_humanize_offset(trigger_td)} at {when}"
+    else:
+        # Post-start alarm (very rare). Phrase accordingly.
+        body_lead = f"{_humanize_offset(trigger_td)} after start ({when})"
+
+    body = body_lead
+    if location:
+        body += f"\n📍 {location}"
+
+    subprocess.Popen(
+        [
+            "notify-send",
+            "--app-name=quickcalendar",
+            "--icon=appointment-soon",
+            "--urgency=normal",
+            "--category=appointment",
+            f"Upcoming: {title}",
+            body,
+        ],
+        start_new_session=True,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+    )
+
+
+def cmd_list(hours, hours_back=0, as_json=False):
+    now = dt.datetime.now(dt.timezone.utc).astimezone()
+    window_lo = now - dt.timedelta(hours=hours_back)
+    window_hi = now + dt.timedelta(hours=hours)
+
+    events = sorted(
+        scan_events(window_lo, window_hi),
+        key=lambda e: e["start"],
+    )
+
+    if as_json:
+        payload = {
+            "generated_at": now.isoformat(),
+            "window": {
+                "from": window_lo.isoformat(),
+                "to": window_hi.isoformat(),
+            },
+            "calendars": load_calendars(),
+            "events": [
+                {
+                    "uid": e["uid"],
+                    "summary": e["summary"],
+                    "start": e["start"].astimezone().isoformat(),
+                    "end": e["end"].astimezone().isoformat(),
+                    "all_day": e["all_day"],
+                    "location": e["location"],
+                    "description": e["description"],
+                    "meet_url": e.get("meet_url", ""),
+                    "recurring": e.get("recurring", False),
+                    "calendar_url": e["calendar_url"],
+                    "calendar_label": e["calendar_label"],
+                    "alarms": [
+                        {
+                            "trigger_seconds": int(a["trigger"].total_seconds()),
+                            "action": a.get("action", "DISPLAY"),
+                            "description": a.get("description", ""),
+                        }
+                        for a in e.get("alarms", []) if a.get("trigger") is not None
+                    ],
+                }
+                for e in events
+            ],
+        }
+        json.dump(payload, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+
+    for ev in events:
+        start = ev["start"].astimezone()
+        print(f"{start.strftime('%Y-%m-%d %H:%M %Z')}  [{ev['calendar_label']}] {ev['summary']}")
+    if not events:
+        print(f"(no events in window)")
+
+
+def cmd_paths():
+    """Print paths calendarview should file-watch. First line is the config
+    file (calendars.txt) — a change there means new/removed feeds, so the
+    consumer should re-fetch this list. Subsequent lines are the cache .ics
+    files; touching any of them (via `refresh` or the timer) means events
+    have shifted and the consumer should reload. One path per line so the
+    output is trivial to parse from QML.
+    """
+    print(CALENDARS_FILE)
+    for cal in load_calendars():
+        print(url_to_cache_path(cal["url"]))
+
+
+def cmd_calendars(as_json=False):
+    """List configured calendars (label + ICS URL + best-effort add URL)."""
+    calendars = load_calendars()
+    if as_json:
+        json.dump(calendars, sys.stdout, indent=2)
+        sys.stdout.write("\n")
+        return
+    if not calendars:
+        print(f"(no calendars configured in {CALENDARS_FILE})")
+        return
+    for c in calendars:
+        print(f"{c['label']}\n  ics: {c['url']}\n  add: {c['add_url']}")
+
+
+def cmd_refresh():
+    """Force re-fetch of all calendar URLs."""
+    clear_cache()
+    urls = load_calendar_urls()
+    if not urls:
+        print(f"No calendars configured. Add ICS URLs to {CALENDARS_FILE}")
+        return
+    print(f"Refreshing {len(urls)} calendar(s)...")
+    for url in urls:
+        content = fetch_ics(url, force_refresh=True)
+        if content:
+            # Count events
+            count = content.count("BEGIN:VEVENT")
+            print(f"  OK: {url[:60]}... ({count} events)")
+        else:
+            print(f"  FAILED: {url[:60]}...")
+
+
+def cmd_show(title, start_iso, description="", location="", end_iso=""):
+    # gtk4-layer-shell must be loaded *before* libwayland-client. If we're
+    # not already preloaded, re-exec ourselves with LD_PRELOAD set —
+    # otherwise the layer surface init silently fails and we get a regular
+    # toplevel window instead of an OVERLAY one.
+    layer_lib = "/usr/lib/libgtk4-layer-shell.so"
+    if os.path.exists(layer_lib) and layer_lib not in os.environ.get("LD_PRELOAD", ""):
+        env = os.environ.copy()
+        env["LD_PRELOAD"] = (
+            f"{layer_lib}:{env['LD_PRELOAD']}" if env.get("LD_PRELOAD") else layer_lib
+        )
+        os.execvpe(sys.executable, [sys.executable, *sys.argv], env)
+
+    import gi
+    gi.require_version("Gtk", "4.0")
+    gi.require_version("Gtk4LayerShell", "1.0")
+    from gi.repository import Gtk, Gdk, Gio, GLib, Gtk4LayerShell as LS
+
+    start_dt = dt.datetime.fromisoformat(start_iso)
+    try:
+        end_dt = dt.datetime.fromisoformat(end_iso) if end_iso else None
+    except ValueError:
+        end_dt = None
+
+    css = b"""
+    window { background-color: #14141ef2; }
+    .title { font-size: 80px; font-weight: 800; color: #ffffff; }
+    .time  { font-size: 44px; color: #c8c8d8; margin-top: 16px; }
+    .location { font-size: 26px; color: #b8b8c8; margin-top: 20px; }
+    .desc  { font-size: 22px; color: #a8a8b8; margin-top: 32px;
+             line-height: 1.35; }
+    .location a, .desc a { color: #7aa8ff; text-decoration: underline; }
+    .hint  { font-size: 18px; color: #6e6e80; margin-top: 60px;
+             letter-spacing: 0.1em; text-transform: uppercase; }
+    """
+
+    # NON_UNIQUE: every `show` invocation must be its own independent process
+    # with exactly one window. The default (single-instance) behaviour means a
+    # second alert fired while an earlier overlay is still on-screen — e.g. an
+    # overnight event left undismissed until the morning — does NOT start its
+    # own process. It forwards a bare `activate` to the lingering primary
+    # instance, whose on_activate re-runs and draws a *second window using the
+    # first event's data*. Result: two stacked identical overlays (compounding
+    # to opaque black, two Escapes to clear) and the second event's real alert
+    # is silently swallowed.
+    app = Gtk.Application(
+        application_id="com.andyjeffries.CalendarAlert",
+        flags=Gio.ApplicationFlags.NON_UNIQUE,
+    )
+
+    def on_activate(application):
+        win = Gtk.ApplicationWindow(application=application)
+        win.set_decorated(False)
+
+        # Use the wlr-layer-shell protocol so the alert sits on the OVERLAY
+        # layer — above every regular and fullscreen window, on every
+        # workspace. xdg-toplevel + Hyprland windowrules can't combine
+        # `pin` with `fullscreen`, so we sidestep both.
+        LS.init_for_window(win)
+        LS.set_layer(win, LS.Layer.OVERLAY)
+        for edge in (LS.Edge.TOP, LS.Edge.BOTTOM, LS.Edge.LEFT, LS.Edge.RIGHT):
+            LS.set_anchor(win, edge, True)
+        LS.set_keyboard_mode(win, LS.KeyboardMode.EXCLUSIVE)
+
+        provider = Gtk.CssProvider()
+        provider.load_from_data(css)
+        Gtk.StyleContext.add_provider_for_display(
+            Gdk.Display.get_default(),
+            provider,
+            Gtk.STYLE_PROVIDER_PRIORITY_APPLICATION,
+        )
+
+        box = Gtk.Box(orientation=Gtk.Orientation.VERTICAL)
+        box.set_halign(Gtk.Align.CENTER)
+        box.set_valign(Gtk.Align.CENTER)
+
+        t = Gtk.Label(label=title)
+        t.add_css_class("title")
+        t.set_wrap(True)
+        t.set_max_width_chars(40)
+        t.set_justify(Gtk.Justification.CENTER)
+        box.append(t)
+
+        # Convert to local time before formatting — recurring occurrences
+        # come through as UTC (see _expand_rrule), so naive strftime would
+        # display "12:30" for a 13:30 BST event.
+        time_str = start_dt.astimezone().strftime("%H:%M")
+        s = Gtk.Label(label=time_str)
+        s.add_css_class("time")
+        box.append(s)
+
+        def on_link(_label, uri):
+            # One click = open the URL AND dismiss the alert. Launch
+            # async so we never block the close; if the launch fails the
+            # alert still goes away.
+            try:
+                Gio.AppInfo.launch_default_for_uri(uri, None)
+            except Exception as e:
+                print(f"quickcalendar-sync: failed to open {uri}: {e}",
+                      file=sys.stderr)
+            win.close()
+            return True
+
+        loc_text = (location or "").strip()
+        if loc_text:
+            loc_label = Gtk.Label()
+            loc_label.set_markup(linkify_for_pango(loc_text))
+            loc_label.add_css_class("location")
+            loc_label.set_wrap(True)
+            loc_label.set_max_width_chars(80)
+            loc_label.set_justify(Gtk.Justification.CENTER)
+            loc_label.connect("activate-link", on_link)
+            box.append(loc_label)
+
+        trimmed_desc = _trim_description(description)
+        if trimmed_desc:
+            d = Gtk.Label()
+            d.set_markup(linkify_for_pango(trimmed_desc))
+            d.add_css_class("desc")
+            d.set_wrap(True)
+            d.set_max_width_chars(80)
+            d.set_justify(Gtk.Justification.CENTER)
+            d.connect("activate-link", on_link)
+            box.append(d)
+
+        h = Gtk.Label(label="press esc or click to dismiss")
+        h.add_css_class("hint")
+        box.append(h)
+
+        win.set_child(box)
+
+        # Esc to close
+        kc = Gtk.EventControllerKey()
+        kc.connect(
+            "key-pressed",
+            lambda _c, keyval, _kc, _st: (win.close(), True)[1]
+            if keyval == Gdk.KEY_Escape
+            else False,
+        )
+        win.add_controller(kc)
+
+        # Click anywhere to close
+        click = Gtk.GestureClick()
+        click.connect("pressed", lambda *_: win.close())
+        win.add_controller(click)
+
+        win.present()
+
+        # Auto-dismiss once the event would have ended, so an alert left
+        # undismissed (e.g. overnight) isn't still on-screen the next morning.
+        # Clamped: shown for at least MIN (visible even if it already ended by
+        # the time we fire) and at most MAX (a mis-parsed or all-day duration
+        # shouldn't keep a fullscreen overlay up for the rest of the day).
+        MIN_SECONDS = 60
+        MAX_SECONDS = 6 * 3600
+        end = end_dt or (start_dt + dt.timedelta(hours=1))
+        now = dt.datetime.now(dt.timezone.utc).astimezone()
+        remaining = (end.astimezone() - now).total_seconds()
+        timeout = int(max(MIN_SECONDS, min(MAX_SECONDS, remaining)))
+        GLib.timeout_add_seconds(
+            timeout, lambda: (win.close(), GLib.SOURCE_REMOVE)[1]
+        )
+
+    app.connect("activate", on_activate)
+    app.run(None)
+
+
+# ---------- entrypoint ----------
+
+def main():
+    p = argparse.ArgumentParser(description=__doc__,
+                                formatter_class=argparse.RawDescriptionHelpFormatter)
+    sub = p.add_subparsers(dest="cmd", required=True)
+    sub.add_parser("check", help="scan calendar; spawn alerts for due events")
+    show = sub.add_parser("show", help="display the fullscreen alert (internal)")
+    show.add_argument("title")
+    show.add_argument("start_iso")
+    show.add_argument("--end", default="",
+                      help="event end time (ISO); overlay auto-dismisses then")
+    show.add_argument("--desc", default="",
+                      help="event description; URLs are auto-linked")
+    show.add_argument("--location", default="",
+                      help="event location; URLs are auto-linked")
+    lst = sub.add_parser("list", help="print upcoming events for sanity-check")
+    lst.add_argument("hours", nargs="?", type=int, default=24,
+                     help="hours to look ahead (default 24)")
+    lst.add_argument("--back", type=int, default=0,
+                     help="hours to also look backward from now")
+    lst.add_argument("--json", action="store_true",
+                     help="emit machine-readable JSON (calendars + events)")
+    cals = sub.add_parser("calendars",
+                          help="list configured calendars (label, ICS URL, add URL)")
+    cals.add_argument("--json", action="store_true",
+                      help="emit machine-readable JSON")
+    sub.add_parser("refresh", help="force re-fetch of all calendar URLs")
+    sub.add_parser(
+        "paths",
+        help="print paths calendarview should file-watch to auto-reload",
+    )
+    args = p.parse_args()
+
+    if args.cmd == "check":
+        cmd_check()
+    elif args.cmd == "show":
+        cmd_show(args.title, args.start_iso, args.desc, args.location, args.end)
+    elif args.cmd == "refresh":
+        cmd_refresh()
+    elif args.cmd == "calendars":
+        cmd_calendars(as_json=args.json)
+    elif args.cmd == "paths":
+        cmd_paths()
+    else:
+        cmd_list(args.hours, hours_back=args.back, as_json=args.json)
+
+
+if __name__ == "__main__":
+    main()

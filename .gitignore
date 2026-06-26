@@ -1,0 +1,8 @@
+# Local runtime state / caches (never published)
+*.pyc
+__pycache__/
+
+# A real calendars.txt would contain private secret-iCal URLs — only the
+# example is tracked. Guard against accidentally committing a live one here.
+calendars.txt
+config/calendars.txt

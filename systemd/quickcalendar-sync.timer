@@ -1,0 +1,11 @@
+[Unit]
+Description=Poll quickcalendar-sync every minute while a graphical session is active
+
+[Timer]
+OnBootSec=1min
+OnUnitActiveSec=1min
+AccuracySec=5s
+Unit=quickcalendar-sync.service
+
+[Install]
+WantedBy=timers.target

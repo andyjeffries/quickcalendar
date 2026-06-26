@@ -1,0 +1,7 @@
+[Unit]
+Description=Scan ICS calendar feeds and fire fullscreen alerts for events starting now
+After=graphical-session.target
+
+[Service]
+Type=oneshot
+ExecStart=%h/.local/bin/quickcalendar-sync check

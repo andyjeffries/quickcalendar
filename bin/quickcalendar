@@ -1,0 +1,61 @@
+#!/bin/sh
+# Launch the calendar viewer (Quickshell QML app).
+# Source: ~/.local/share/quickcalendar/shell.qml (installed by quickcalendar)
+#
+# Singleton with two layers, because the old "is there a window titled
+# 'Calendar View'?" check has a ~1s race window: quickshell is exec'd, the
+# process exists, but the QML hasn't created the window yet — a second
+# invocation in that gap also sees no title and spawns its own copy. The
+# end-state is 2-3 calendar views tiled on top of each other.
+#
+#   1. flock serialises near-concurrent invocations (ws1-dashboard + a
+#      keybind firing back-to-back can't both win).
+#   2. We then check for an existing process by command line, not by
+#      window title — the process is observable the instant exec returns,
+#      so there's no startup gap to slip through.
+#
+# Either layer alone would let one race-class through; together they close it.
+
+qml="$HOME/.local/share/quickcalendar/shell.qml"
+lockdir="${XDG_RUNTIME_DIR:-/tmp}"
+exec 9>"$lockdir/quickcalendar.lock"
+flock -x 9
+
+# 1. Already showing a real window? Focus it and exit.
+if command -v hyprctl >/dev/null 2>&1; then
+    addr=$(hyprctl clients -j 2>/dev/null \
+        | jq -r '.[] | select(.title == "Calendar View") | .address' \
+        | head -n 1)
+    if [ -n "$addr" ]; then
+        hyprctl dispatch focuswindow "address:$addr" >/dev/null
+        exit 0
+    fi
+fi
+
+# 2. No window but maybe orphan quickshell processes lingering from a
+# previous session (window closed, process didn't quit). Under the flock
+# we're guaranteed no other wrapper is mid-spawn, so it's safe to clean
+# them up before we start a fresh copy.
+if pgrep -f "quickshell .*quickcalendar/shell\.qml" >/dev/null 2>&1; then
+    pkill -f "quickshell .*quickcalendar/shell\.qml" 2>/dev/null
+    for _ in 1 2 3 4 5; do
+        pgrep -f "quickshell .*quickcalendar/shell\.qml" >/dev/null 2>&1 || break
+        sleep 0.2
+    done
+fi
+
+# 3. Spawn detached, then hold the lock until the new window registers in
+# Hyprland (or ~3s elapses) so subsequent invocations can resolve it via
+# hyprctl. setsid + null fds let the child outlive the wrapper. The 9>&-
+# is critical: without it, quickshell inherits the lock fd and holds the
+# lock for the rest of its life, so the next wrapper invocation blocks on
+# flock until quickshell dies. Closing fd 9 in the child only keeps the
+# lock confined to the wrapper's own lifetime.
+setsid quickshell -p "$qml" "$@" 9>&- </dev/null >/dev/null 2>&1 &
+if command -v hyprctl >/dev/null 2>&1; then
+    for _ in 1 2 3 4 5 6; do
+        sleep 0.5
+        hyprctl clients -j 2>/dev/null \
+            | jq -e '.[] | select(.title == "Calendar View")' >/dev/null 2>&1 && break
+    done
+fi
