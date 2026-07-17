@@ -11,6 +11,7 @@ Item {
     property var theme        // the FloatingWindow root — provides colors + helpers
     property date weekAnchor  // Monday of the visible week (local midnight)
     property var events       // array of event objects from quickcalendar-sync --json
+    property var selectedDate: null  // day picked from the month overlay (highlighted)
 
     // ---- visual config ----
     // hourHeight stretches with the viewport so the day always overflows the
@@ -270,6 +271,7 @@ Item {
                 height: grid.dayHeaderHeight
                 property var date: grid.weekDays[index]
                 property bool isToday: grid.theme.sameDay(date, grid.currentTime)
+                property bool isSelected: grid.selectedDate && grid.theme.sameDay(date, grid.selectedDate)
 
                 Column {
                     anchors.centerIn: parent
@@ -286,6 +288,10 @@ Item {
                         anchors.horizontalCenter: parent.horizontalCenter
                         width: grid.theme.fs(32); height: grid.theme.fs(32); radius: grid.theme.fs(16)
                         color: dayHeader.isToday ? grid.theme.accent : "transparent"
+                        // A selected-but-not-today day gets an accent ring so the
+                        // day picked in the month overlay is obvious in the week.
+                        border.color: (!dayHeader.isToday && dayHeader.isSelected) ? grid.theme.accent : "transparent"
+                        border.width: (!dayHeader.isToday && dayHeader.isSelected) ? 2 : 0
                         Text {
                             anchors.centerIn: parent
                             text: dayHeader.date.getDate()

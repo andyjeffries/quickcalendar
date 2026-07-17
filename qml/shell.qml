@@ -48,6 +48,16 @@ FloatingWindow {
     // Anchor = Monday of the displayed week, at local midnight.
     property var weekAnchor: mondayOf(new Date())
 
+    // ---- month overlay ----
+    // The "M" overlay (MonthGrid) slides in over the week grid. While it's open
+    // the prev/next buttons + Left/Right keys step a month at a time; the top
+    // title tracks monthAnchor instead of the week. selectedDate is the day last
+    // picked (from the month grid, or navigated to) — highlighted in the week
+    // grid so "which day did I pick" reads at a glance.
+    property bool monthOverlayOpen: false
+    property var monthAnchor: firstOfMonth(new Date())
+    property var selectedDate: null
+
     // ---- live clock + midnight rollover ----
     // A single reactive "now", ticked every 30s, that every date-dependent
     // binding reads (today highlight, now-line). A bare `new Date()` inside a
@@ -140,6 +150,18 @@ FloatingWindow {
     function addDays(d, n) {
         var x = new Date(d);
         x.setDate(x.getDate() + n);
+        return x;
+    }
+    function firstOfMonth(d) {
+        var x = startOfDay(d);
+        x.setDate(1);
+        return x;
+    }
+    // Add n calendar months, pinned to the 1st so day-of-month overflow (e.g.
+    // Jan 31 → "Mar 3") can't happen.
+    function addMonths(d, n) {
+        var x = firstOfMonth(d);
+        x.setMonth(x.getMonth() + n);
         return x;
     }
     function sameDay(a, b) {
@@ -251,6 +273,37 @@ FloatingWindow {
     }
     function openEventDetails(e) { selectedEvent = e; }
     function closeEventDetails() { selectedEvent = null; }
+
+    // ---- navigation ----
+    // Prev/next step by month while the overlay is open, else by week. Both the
+    // header ‹ › buttons and the Left/Right/H/L keys route through here so the
+    // two stay in lockstep.
+    function goPrev() {
+        if (monthOverlayOpen) monthAnchor = addMonths(monthAnchor, -1);
+        else                  weekAnchor = addDays(weekAnchor, -7);
+    }
+    function goNext() {
+        if (monthOverlayOpen) monthAnchor = addMonths(monthAnchor, 1);
+        else                  weekAnchor = addDays(weekAnchor, 7);
+    }
+    function goToday() {
+        weekAnchor = mondayOf(new Date());
+        if (monthOverlayOpen) monthAnchor = firstOfMonth(new Date());
+    }
+    // Toggle the month overlay. On open, seed monthAnchor from the middle of the
+    // visible week (Thursday) so a week straddling two months opens on the month
+    // that owns most of it.
+    function toggleMonthOverlay() {
+        if (!monthOverlayOpen) monthAnchor = firstOfMonth(addDays(weekAnchor, 3));
+        monthOverlayOpen = !monthOverlayOpen;
+    }
+    // Picking a day in the month grid: remember it, jump the week view to its
+    // week, and close the overlay.
+    function selectDate(d) {
+        selectedDate = startOfDay(d);
+        weekAnchor = mondayOf(d);
+        monthOverlayOpen = false;
+    }
 
     // Triggered by the digit shortcuts (1-9) while the FAB menu is open, and
     // also by mouse clicks on the menu rows. Closes the menu and dispatches
@@ -441,9 +494,11 @@ FloatingWindow {
         onActivated: {
             if (root.selectedEvent) root.selectedEvent = null;
             else if (root.newEventMenuOpen) root.newEventMenuOpen = false;
+            else if (root.monthOverlayOpen) root.monthOverlayOpen = false;
         }
     }
-    Shortcut { sequence: "T"; onActivated: { root.weekAnchor = root.mondayOf(new Date()); } }
+    Shortcut { sequence: "T"; onActivated: root.goToday() }
+    Shortcut { sequence: "M"; onActivated: root.toggleMonthOverlay() }
 
     // Browser-style text zoom. Ctrl+= is the unshifted "+", Ctrl++ catches
     // keyboards that report Shift+= as a real "+", Ctrl+- shrinks, Ctrl+0
@@ -451,8 +506,8 @@ FloatingWindow {
     Shortcut { sequences: ["Ctrl+=", "Ctrl++"]; onActivated: root.bumpFontScale(root.fontScaleStep) }
     Shortcut { sequence: "Ctrl+-"; onActivated: root.bumpFontScale(-root.fontScaleStep) }
     Shortcut { sequence: "Ctrl+0"; onActivated: root.fontScale = 1.0 }
-    Shortcut { sequences: ["Left", "H"]; onActivated: { root.weekAnchor = root.addDays(root.weekAnchor, -7); } }
-    Shortcut { sequences: ["Right", "L"]; onActivated: { root.weekAnchor = root.addDays(root.weekAnchor, 7); } }
+    Shortcut { sequences: ["Left", "H"]; onActivated: root.goPrev() }
+    Shortcut { sequences: ["Right", "L"]; onActivated: root.goNext() }
     Shortcut { sequence: "N"; onActivated: { if (root.calendars.length > 0) root.newEventMenuOpen = !root.newEventMenuOpen; } }
 
     // After N opens the menu, 1-9 picks a calendar. The shortcuts are gated
@@ -497,7 +552,11 @@ FloatingWindow {
                     spacing: 16
 
                     Text {
-                        text: root.weekTitle()
+                        // While the month overlay is up the title names the
+                        // displayed month; otherwise it describes the week.
+                        text: root.monthOverlayOpen
+                              ? Qt.formatDate(root.monthAnchor, "MMMM yyyy")
+                              : root.weekTitle()
                         font.pixelSize: root.fs(22)
                         font.weight: Font.DemiBold
                         color: root.text
@@ -508,9 +567,9 @@ FloatingWindow {
                     // Nav cluster: ‹  Today  ›
                     Row {
                         spacing: 4
-                        NavButton { glyph: "‹"; onClicked: { root.weekAnchor = root.addDays(root.weekAnchor, -7); } }
-                        TodayButton { onClicked: { root.weekAnchor = root.mondayOf(new Date()); } }
-                        NavButton { glyph: "›"; onClicked: { root.weekAnchor = root.addDays(root.weekAnchor, 7); } }
+                        NavButton { glyph: "‹"; onClicked: root.goPrev() }
+                        TodayButton { onClicked: root.goToday() }
+                        NavButton { glyph: "›"; onClicked: root.goNext() }
                     }
 
                     // Refresh button
@@ -522,14 +581,40 @@ FloatingWindow {
                 }
             }
 
-            // ============================== WEEK GRID ==============================
-            WeekGrid {
-                id: grid
+            // ============================== BODY (week grid + month overlay) ======
+            // The month overlay is scoped to exactly this cell — the same region
+            // WeekGrid occupies — so it covers the day-of-week header and body
+            // but never the title/nav header above or the status bar below.
+            // clip keeps the slide-in from spilling past the body edges.
+            Item {
+                id: bodyArea
                 Layout.fillWidth: true
                 Layout.fillHeight: true
-                theme: root
-                weekAnchor: root.weekAnchor
-                events: root.events
+                clip: true
+
+                WeekGrid {
+                    id: grid
+                    anchors.fill: parent
+                    theme: root
+                    weekAnchor: root.weekAnchor
+                    events: root.events
+                    selectedDate: root.selectedDate
+                }
+
+                MonthOverlay {
+                    id: monthOverlay
+                    anchors { top: parent.top; bottom: parent.bottom }
+                    width: parent.width
+                    // Parked one width to the left when closed; slides to 0 open.
+                    x: root.monthOverlayOpen ? 0 : -width
+                    visible: x > -width
+                    theme: root
+                    monthAnchor: root.monthAnchor
+                    events: root.events
+                    selectedDate: root.selectedDate
+                    onDaySelected: root.selectDate(day)
+                    Behavior on x { NumberAnimation { duration: 200; easing.type: Easing.OutCubic } }
+                }
             }
 
             // ============================== STATUS BAR ==============================
@@ -549,7 +634,15 @@ FloatingWindow {
                     anchors.rightMargin: 16
                     spacing: 18
 
-                    ShortcutHint { keys: ["‹", "›"]; label: "week" }
+                    // Prev/next are the Left/Right arrow keys — draw them as
+                    // crisp filled triangles (the ◀ ▶ key-cap style shared with
+                    // the screen recorder / video trimmer) rather than ‹ › text.
+                    // The label tracks what a press actually moves.
+                    ShortcutHint {
+                        arrows: [-1, 1]
+                        label: root.monthOverlayOpen ? "month" : "week"
+                    }
+                    ShortcutHint { keys: ["M"]; label: "month view" }
                     ShortcutHint { keys: ["T"]; label: "today" }
                     ShortcutHint { keys: ["N"]; label: "new event" }
                     ShortcutHint { keys: ["⌃+", "⌃−"]; label: "zoom" }
@@ -825,19 +918,46 @@ FloatingWindow {
     // Reads "this key triggers the action sitting next to it."
     component KbdBadge: Rectangle {
         property string label: ""
+        // arrow: 0 → render `label` text; -1 → ◀, 1 → ▶ drawn as a crisp centred
+        // triangle (the ←/→ font glyphs render badly at this size). Matches the
+        // key-cap style used in ScreenRecord.qml / videotrim.
+        property int arrow: 0
         implicitHeight: root.fs(18)
-        implicitWidth: Math.max(root.fs(20), badgeText.implicitWidth + 10)
+        implicitWidth: arrow !== 0
+                       ? root.fs(20)
+                       : Math.max(root.fs(20), badgeText.implicitWidth + 10)
         radius: 4
         color: root.surface
         border.color: root.borderStrong
         border.width: 1
         Text {
             id: badgeText
+            visible: parent.arrow === 0
             anchors.centerIn: parent
             text: parent.label
             font.pixelSize: root.fs(10)
             font.family: "monospace"
             color: root.text
+        }
+        Canvas {
+            id: arrowCanvas
+            anchors.fill: parent
+            visible: parent.arrow !== 0
+            // Repaints on resize; the badge's implicitWidth is fs-derived, so a
+            // Ctrl+± zoom changes width and re-triggers this. arrow is static per
+            // instance, so no arrow-change repaint is needed.
+            onWidthChanged: requestPaint()
+            onHeightChanged: requestPaint()
+            Component.onCompleted: requestPaint()
+            onPaint: {
+                var ctx = getContext("2d"); ctx.reset();
+                ctx.fillStyle = String(root.text);
+                var cx = width / 2, cy = height / 2, s = root.fs(3.5);
+                ctx.beginPath();
+                if (parent.arrow < 0) { ctx.moveTo(cx + s, cy - s); ctx.lineTo(cx - s, cy); ctx.lineTo(cx + s, cy + s); }
+                else                  { ctx.moveTo(cx - s, cy - s); ctx.lineTo(cx + s, cy); ctx.lineTo(cx - s, cy + s); }
+                ctx.closePath(); ctx.fill();
+            }
         }
     }
 
@@ -846,10 +966,17 @@ FloatingWindow {
     // layout readable.
     component ShortcutHint: Row {
         property var keys: []
+        // Optional filled-triangle badges (values -1/1). Rendered before any
+        // text `keys`; used for the Left/Right nav hint.
+        property var arrows: []
         property string label: ""
         spacing: 6
         Row {
             spacing: 2
+            Repeater {
+                model: parent.parent.arrows
+                delegate: KbdBadge { arrow: modelData }
+            }
             Repeater {
                 model: parent.parent.keys
                 delegate: KbdBadge { label: modelData }
