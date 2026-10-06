@@ -80,7 +80,7 @@ abort, since the viewer still works without the GTK4 alert pieces.)
 
 ## Configuring feeds
 
-`~/.config/quickcalendar/calendars.txt` is one ICS URL per line, with optional
+`~/.config/quickcalendar/calendars.txt` is one ICS URL (or local path) per line, with optional
 `# tag: value` lines directly above a URL. The seeded file documents every tag;
 the essentials:
 
@@ -98,8 +98,34 @@ https://ics.ecal.com/.../Formula%201.ics
 - `name:` — display label
 - `colour:` — event chip colour (any CSS hex)
 - `readonly:` — render the feed but hide it from the "+" create-event picker
+- `day_background:` — all-day events tint their whole day in a faint version
+  of the calendar's colour (and sit in the pinned all-day row above the hour
+  grid). On by default; `# day_background: false` keeps the chip but drops the
+  tint — for feeds like a team-holidays calendar where an all-day event
+  doesn't mean *you're* busy. When several calendars tint the same day, the
+  one listed first in `calendars.txt` wins.
 - `add_event_url:` / `add_group:` — where the "+" picker sends you to create
   events (sensible defaults for Google and iCloud)
+
+A line can also be a **local path** (`/abs/path`, `~/path` or `file://…`)
+instead of a URL:
+
+- **Executable** → it's run and its stdout is used as the ICS. Output is cached
+  like a remote feed (`cache_max_age`, default 5 min), and if a run fails the
+  last good output is kept. Handy for feeds you build yourself.
+- **Anything else** → read as an `.ics` file. Good for a generator that's too
+  slow to run every few minutes: have a daily timer write the file and point
+  quickcalendar at it.
+
+Local sources are read-only unless you tag them `# readonly: false`.
+
+```ini
+# name: Football
+~/.local/bin/my-fixtures-feed
+
+# name: Imported
+~/.local/share/calendars/imported.ics
+```
 
 Getting a secret ICS URL:
 

@@ -242,6 +242,50 @@ FloatingWindow {
     function calStripe(url) { var c = _calHs(url); return Qt.hsla(c.h, c.s, 0.46, 1); }
     function calText(url)   { var c = _calHs(url); return Qt.hsla(c.h, Math.min(0.8, c.s), 0.22, 1); }
     function calDot(url)    { var c = _calHs(url); return Qt.hsla(c.h, c.s, 0.50, 1); }
+    // Paler than calBg, so an all-day event's chip still stands out on the
+    // day it tints.
+    function calDayTint(url) { var c = _calHs(url); return Qt.hsla(c.h, Math.max(0.3, c.s * 0.65), 0.972, 1); }
+
+    // ---- all-day day tint ----
+    // Position in calendars.txt; a lower rank wins the tint when all-day
+    // events from several calendars land on the same day.
+    readonly property var calRank: {
+        var m = {};
+        for (var i = 0; i < calendars.length; i++) m[calendars[i].url] = i;
+        return m;
+    }
+
+    // Does `ev` cover local day `day`? All-day events compare local calendar
+    // dates (their ICS DATE arrives as UTC midnight, i.e. 01:00 in BST, so a
+    // plain time overlap would also catch the first hour of the day after).
+    function eventCoversDay(ev, day) {
+        if (ev.all_day === true) {
+            var s = localDayDiff(day, ev._start);
+            var e = Math.max(localDayDiff(day, ev._end), s + 1);
+            return s <= 0 && e > 0;
+        }
+        var ds = startOfDay(day);
+        return ev._end > ds && ev._start < addDays(ds, 1);
+    }
+
+    // Background for a whole day: the faint colour of its highest-ranked
+    // all-day event, skipping calendars tagged `day_background: false`.
+    // Transparent when nothing applies.
+    function dayTint(day) {
+        var best = null, bestRank = Infinity;
+        for (var i = 0; i < events.length; i++) {
+            var ev = events[i];
+            if (ev.all_day !== true) continue;
+            var cal = calsByUrl[ev.calendar_url];
+            if (cal && cal.day_background === false) continue;
+            var rank = calRank[ev.calendar_url];
+            if (rank === undefined) rank = calendars.length;
+            if (rank >= bestRank || !eventCoversDay(ev, day)) continue;
+            best = ev;
+            bestRank = rank;
+        }
+        return best ? calDayTint(best.calendar_url) : "transparent";
+    }
 
     // ---- header label for the visible week ----
     function weekTitle() {
@@ -255,11 +299,54 @@ FloatingWindow {
     }
 
     // ---- data loading ----
+    // The events window follows the view rather than being fixed around
+    // today: a fixed ±N days silently showed an empty week once you paged
+    // past it (December looked free while it was 74 days out). We load from
+    // 5 weeks before the visible range to 9 weeks after it, and re-centre
+    // whenever navigation leaves what's loaded.
+    readonly property int loadBackDays: 35
+    readonly property int loadAheadDays: 63
+    property var _loadedLo: null
+    property var _loadedHi: null
+    property bool _reloadQueued: false
+    // First and last+1 day on screen: the week, or the whole 6-week month
+    // grid while the overlay is open.
+    function _viewRange() {
+        var lo = monthOverlayOpen ? mondayOf(monthAnchor) : weekAnchor;
+        return { lo: lo, hi: addDays(lo, monthOverlayOpen ? 42 : 7) };
+    }
+    function ensureLoaded() {
+        var v = _viewRange();
+        if (!_loadedLo || v.lo < _loadedLo || v.hi > _loadedHi) reload();
+    }
+    onWeekAnchorChanged: ensureLoaded()
+    onMonthAnchorChanged: ensureLoaded()
+    onMonthOverlayOpenChanged: ensureLoaded()
+
     function reload() {
-        if (loading) return;
+        // A reload asked for mid-flight (e.g. paging fast) must not be lost:
+        // its window may differ from the one being fetched.
+        if (loading) { _reloadQueued = true; return; }
+        var v = _viewRange();
+        var lo = addDays(v.lo, -loadBackDays);
+        var hi = addDays(v.hi, loadAheadDays);
+        var now = new Date();
+        var ahead = Math.ceil((hi - now) / 3600000);
+        var back = Math.ceil((now - lo) / 3600000);
         loading = true;
+        eventsProc.pendingLo = lo;
+        eventsProc.pendingHi = hi;
+        // `--back=N` and `--` because either value is negative when the
+        // window sits wholly in the future or past, and argparse would read a
+        // bare "-N" as an option.
+        eventsProc.command = ["quickcalendar-sync", "list", "--back=" + back,
+                              "--json", "--", String(ahead)];
         eventsProc.running = false;
         eventsProc.running = true;
+    }
+    function _loadFinished() {
+        loading = false;
+        if (_reloadQueued) { _reloadQueued = false; reload(); }
     }
     function refresh() {
         // Force a re-fetch of the ICS feeds, then reload.
@@ -325,9 +412,11 @@ FloatingWindow {
 
     Process {
         id: eventsProc
-        // 60-day lookahead, 30-day lookback covers ±4 weeks of navigation.
-        // quickcalendar-sync is fast on cached ICS so the wide window is cheap.
-        command: ["quickcalendar-sync", "list", "1440", "--back", "720", "--json"]
+        // command is built by reload() from the visible range; the window it
+        // asked for becomes root._loadedLo/_loadedHi once the reply parses.
+        property var pendingLo: null
+        property var pendingHi: null
+        command: ["true"]
         running: false
         stdout: StdioCollector {
             onStreamFinished: {
@@ -343,7 +432,7 @@ FloatingWindow {
                     // body-only edit will surface next time you click in.
                     var key = JSON.stringify({
                         cs: (d.calendars || []).map(function(c) {
-                            return [c.url, c.label, c.color || ""];
+                            return [c.url, c.label, c.color || "", c.day_background !== false];
                         }),
                         es: (d.events || []).map(function(e) {
                             return [
@@ -355,8 +444,10 @@ FloatingWindow {
                             ];
                         }),
                     });
+                    root._loadedLo = eventsProc.pendingLo;
+                    root._loadedHi = eventsProc.pendingHi;
                     if (key === root._lastContentKey) {
-                        root.loading = false;
+                        root._loadFinished();
                         return;
                     }
                     root._lastContentKey = key;
@@ -370,7 +461,7 @@ FloatingWindow {
                 } catch (e) {
                     console.warn("quickcalendar: failed to parse json:", e);
                 }
-                root.loading = false;
+                root._loadFinished();
             }
         }
         stderr: StdioCollector {

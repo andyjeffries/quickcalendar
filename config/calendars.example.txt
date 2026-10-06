@@ -15,6 +15,12 @@
 #   Calendar app > Right-click calendar > Share Calendar > Public Calendar
 #   Copy the webcal:// URL (left as-is — quickcalendar rewrites to https://).
 #
+# Local sources
+#   A line may be a local path instead of a URL: /abs/path, ~/path or
+#   file:///abs/path. If it's executable it's run and its stdout used as the
+#   ICS (cached for cache_max_age, last good output kept on failure);
+#   otherwise it's read as an .ics file. Read-only unless tagged otherwise.
+#
 # ─────────────────────────────────────────────────────────────────────────
 # Optional per-calendar tags (place on `# tag: value` lines directly above
 # the URL; a blank line resets all pending tags). All tags are optional and
@@ -37,6 +43,12 @@
 #                                 public subscriptions you can't write to
 #                                 (F1, UFC, sports schedules, etc.).
 #                                 Aliases: read_only, view_only.
+#   # day_background: false       Don't tint whole days behind this feed's
+#                                 all-day events (on by default). For feeds
+#                                 whose all-day events don't make *you* busy,
+#                                 e.g. a staff-holidays calendar. When several
+#                                 calendars tint the same day, the one listed
+#                                 first here wins. Aliases: day_tint, background.
 #
 # ─────────────────────────────────────────────────────────────────────────
 # Examples (delete these and add your own)

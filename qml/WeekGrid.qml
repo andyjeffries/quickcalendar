@@ -93,7 +93,13 @@ Item {
         // short chips sit above it.
         var W2 = dayColumnWidth;
         var laidAd = [];
-        var items = ad.map(function(e) {
+        // Compare local dates, not instants: in BST an all-day event ends at
+        // 01:00 on the day after, so the time-overlap filter above also lets
+        // through last Sunday's event (ending Monday 01:00).
+        var items = ad.filter(function(e) {
+            var s = theme.localDayDiff(weekAnchor, e._start);
+            return s < 7 && Math.max(theme.localDayDiff(weekAnchor, e._end), s + 1) > 0;
+        }).map(function(e) {
             var sd = Math.max(0, theme.localDayDiff(weekAnchor, e._start));
             var ed = Math.min(7, theme.localDayDiff(weekAnchor, e._end));
             return { event: e, startDay: sd, endDay: ed, span: Math.max(1, ed - sd), lane: 0 };
@@ -342,13 +348,21 @@ Item {
             color: grid.theme.textFaint
         }
 
-        // column dividers
+        // column dividers, plus the day tint so it runs unbroken from this
+        // row down through the hour grid
         Repeater {
             model: 7
-            delegate: Rectangle {
+            delegate: Item {
                 x: grid.timeGutterWidth + index * grid.dayColumnWidth
-                y: 4; width: 1; height: parent.height - 8
-                color: grid.theme.border
+                width: grid.dayColumnWidth; height: parent.height
+                Rectangle {
+                    anchors.fill: parent
+                    color: grid.theme.dayTint(grid.weekDays[index])
+                }
+                Rectangle {
+                    y: 4; width: 1; height: parent.height - 8
+                    color: grid.theme.border
+                }
             }
         }
 
@@ -415,10 +429,16 @@ Item {
                 height: grid.gridContentHeight
                 property var date: grid.weekDays[index]
                 property bool isToday: grid.theme.sameDay(date, grid.currentTime)
+                // Re-evaluated when events change (dayTint reads theme.events).
+                property color allDayTint: grid.theme.dayTint(date)
 
+                // An all-day event's tint wins over today's: today stays
+                // marked by the header pill and the now-line.
                 Rectangle {
                     anchors.fill: parent
-                    color: dayCol.isToday ? grid.theme.todayTint : "transparent"
+                    color: dayCol.allDayTint.a > 0 ? dayCol.allDayTint
+                         : dayCol.isToday          ? grid.theme.todayTint
+                         :                           "transparent"
                 }
                 Rectangle {
                     x: 0; y: 0; width: 1; height: dayCol.height

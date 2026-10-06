@@ -15,8 +15,10 @@ Subcommands:
   refresh               force re-fetch of all calendar URLs (clears cache).
 
 Source of truth:
-  ~/.config/quickcalendar/calendars.txt — one ICS URL per line.
-  Supports iCloud, Google Calendar, or any public/private ICS feed.
+  ~/.config/quickcalendar/calendars.txt — one ICS source per line.
+  Supports iCloud, Google Calendar, or any public/private ICS feed, plus
+  local paths (/abs, ~/rel or file://): an executable is run and its stdout
+  used as the ICS; anything else is read as an .ics file.
   Lines starting with # are comments. Blank lines are ignored.
 
 Settings (optional):
@@ -37,6 +39,7 @@ import os
 import re
 import subprocess
 import sys
+import urllib.parse
 import urllib.request
 import urllib.error
 from pathlib import Path
@@ -93,6 +96,12 @@ _TAG_ALIASES = {
     "readonly":       "readonly",
     "read_only":      "readonly",
     "view_only":      "readonly",
+    # Tint the whole day behind an all-day event in this calendar's colour.
+    # On by default; turn it off for feeds whose all-day events don't mean
+    # *you're* busy (e.g. a staff-holidays calendar).
+    "day_background": "day_background",
+    "day_tint":       "day_background",
+    "background":     "day_background",
 }
 
 
@@ -249,6 +258,10 @@ def load_settings():
     return settings
 
 
+_NO_TAGS = {"label": None, "color": None, "add_url": None,
+            "add_group": None, "readonly": None, "day_background": None}
+
+
 def load_calendars():
     """Parse calendars.txt into [{label, url, add_url, color}, ...].
 
@@ -263,6 +276,9 @@ def load_calendars():
                                        one entry in calendarview's picker.
         # readonly: true             (also: read_only, view_only) — render
                                        events but hide from the picker.
+        # day_background: false      (also: day_tint, background) — don't
+                                       tint whole days behind this calendar's
+                                       all-day events (default: true).
 
     Any other comment line is treated as a plain comment and used as a fallback
     label (so old `# My Calendar` formatting still works).
@@ -277,15 +293,13 @@ def load_calendars():
     if not CALENDARS_FILE.exists():
         return []
     out = []
-    pending = {"label": None, "color": None, "add_url": None,
-               "add_group": None, "readonly": None}
+    pending = dict(_NO_TAGS)
     fallback_label = None
     n = 0
     for raw in CALENDARS_FILE.read_text().splitlines():
         line = raw.strip()
         if not line:
-            pending = {"label": None, "color": None, "add_url": None,
-                       "add_group": None, "readonly": None}
+            pending = dict(_NO_TAGS)
             fallback_label = None
             continue
         if line.startswith("#"):
@@ -312,6 +326,9 @@ def load_calendars():
         url = line
         if url.startswith("webcal://"):
             url = "https://" + url[9:]
+        local = _local_path(url)
+        if local is not None:
+            url = str(local)
         n += 1
         out.append({
             "label": pending["label"] or fallback_label or f"Calendar {n}",
@@ -319,10 +336,16 @@ def load_calendars():
             "add_url": pending["add_url"] or _add_url_for(url),
             "color": pending["color"],
             "add_group": pending["add_group"],
-            "readonly": _is_truthy(pending["readonly"]),
+            # A local file/script has nowhere to add events to, so it's
+            # read-only unless the tag explicitly says otherwise.
+            "readonly": (_is_truthy(pending["readonly"])
+                         if pending["readonly"] is not None
+                         else local is not None),
+            "day_background": (_is_truthy(pending["day_background"])
+                               if pending["day_background"] is not None
+                               else True),
         })
-        pending = {"label": None, "color": None, "add_url": None,
-                   "add_group": None, "readonly": None}
+        pending = dict(_NO_TAGS)
         fallback_label = None
     return out
 
@@ -337,15 +360,76 @@ def _add_url_for(ics_url):
     return ics_url
 
 
+def _local_path(source):
+    """Return the Path for a local calendar source, or None for a URL.
+
+    Local sources are absolute paths, `~/…` paths or file:// URLs. Relative
+    paths aren't accepted — the timer's cwd isn't something to rely on.
+    """
+    if source.startswith("file://"):
+        source = urllib.parse.unquote(source[7:])
+    if source.startswith("~"):
+        return Path(source).expanduser()
+    if source.startswith("/"):
+        return Path(source)
+    return None
+
+
 def url_to_cache_path(url):
     """Generate a cache filename for a URL."""
     h = hashlib.sha256(url.encode()).hexdigest()[:16]
     return CACHE_DIR / f"{h}.ics"
 
 
+def _read_local_ics(path, cache_path, force_refresh, max_age):
+    """ICS content from a local source.
+
+    Executable → run it and use its stdout. It's cached like a remote feed
+    (so a slow script runs at most once per cache_max_age) and a failed run
+    falls back to the last good output.
+
+    Otherwise → read the file. It's mirrored into the cache so the viewer,
+    which file-watches cache paths (see `paths`), reloads when it changes.
+    """
+    if os.access(path, os.X_OK) and path.is_file():
+        if not force_refresh and cache_path.exists():
+            age = dt.datetime.now().timestamp() - cache_path.stat().st_mtime
+            if age < max_age:
+                return cache_path.read_text()
+        try:
+            res = subprocess.run([str(path)], capture_output=True, text=True,
+                                 timeout=120, stdin=subprocess.DEVNULL)
+            if res.returncode != 0 or "BEGIN:VCALENDAR" not in res.stdout:
+                raise OSError(f"exit {res.returncode}: "
+                              f"{res.stderr.strip()[-300:] or 'no ICS on stdout'}")
+            content = res.stdout
+        except (OSError, subprocess.SubprocessError) as e:
+            print(f"quickcalendar-sync: script {path} failed: {e}", file=sys.stderr)
+            if cache_path.exists():
+                print(f"quickcalendar-sync: using stale cache for {path}", file=sys.stderr)
+                return cache_path.read_text()
+            return None
+    else:
+        try:
+            content = path.read_text(encoding="utf-8", errors="replace")
+        except OSError as e:
+            print(f"quickcalendar-sync: can't read {path}: {e}", file=sys.stderr)
+            return cache_path.read_text() if cache_path.exists() else None
+        # Only rewrite on change: an mtime bump makes the viewer reload.
+        if cache_path.exists() and cache_path.read_text() == content:
+            return content
+    CACHE_DIR.mkdir(parents=True, exist_ok=True)
+    cache_path.write_text(content)
+    return content
+
+
 def fetch_ics(url, force_refresh=False, max_age=CACHE_MAX_AGE):
     """Fetch an ICS file, using cache if fresh enough."""
     cache_path = url_to_cache_path(url)
+
+    local = _local_path(url)
+    if local is not None:
+        return _read_local_ics(local, cache_path, force_refresh, max_age)
 
     # Check cache freshness
     if not force_refresh and cache_path.exists():
@@ -697,12 +781,18 @@ def _emit(uid, occ_start, master_or_ov, calendar, recurring=False):
     }
 
 
-def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_MAX_AGE):
+def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_MAX_AGE,
+                overlap=False):
     """Yield event dicts for occurrences in [window_lo, window_hi].
 
     Each dict has: uid, occ_key, summary, start, end, all_day, description,
     location, calendar_url, calendar_label. occ_key is unique per occurrence
     so dedupe state can distinguish repeats.
+
+    By default an occurrence must *start* inside the window — what the alert
+    check wants. overlap=True also yields occurrences that started earlier but
+    are still running at window_lo, which a viewer needs: a fortnight-long
+    all-day event must still paint on its last few days.
     """
     calendars = load_calendars()
     if not calendars:
@@ -732,6 +822,11 @@ def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_M
             else:
                 events_by_uid[key]["master"] = event
 
+    def in_window(start, ev):
+        if overlap:
+            return start <= window_hi and start + _event_duration(ev) > window_lo
+        return window_lo <= start <= window_hi
+
     for (url, uid), group in events_by_uid.items():
         master = group["master"]
         overrides = group["overrides"]
@@ -748,7 +843,7 @@ def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_M
         # override itself doesn't carry an rrule.
         for ov in overrides:
             start = ov["dtstart"]
-            if start and window_lo <= start <= window_hi:
+            if start and in_window(start, ov):
                 yield _emit(uid, start, ov, calendar, recurring=True)
 
         # Process master event
@@ -761,9 +856,12 @@ def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_M
 
         if master["rrule"]:
             # Recurring event - expand occurrences
+            # In overlap mode, expand from one duration earlier so an
+            # occurrence already in progress at window_lo is included.
+            lo = window_lo - _event_duration(master) if overlap else window_lo
             for occ in _expand_rrule(
                 master["rrule"], master.get("exdates", []),
-                start, window_lo, window_hi
+                start, lo, window_hi
             ):
                 # Skip if there's an override for this time
                 if any(abs(occ.timestamp() - ov_t) < 60 for ov_t in override_times):
@@ -771,7 +869,7 @@ def scan_events(window_lo, window_hi, force_refresh=False, cache_max_age=CACHE_M
                 yield _emit(uid, occ, master, calendar, recurring=True)
         else:
             # Single event
-            if window_lo <= start <= window_hi:
+            if in_window(start, master):
                 yield _emit(uid, start, master, calendar)
 
 
@@ -1086,7 +1184,8 @@ def cmd_list(hours, hours_back=0, as_json=False):
 
     events = sorted(
         scan_events(window_lo, window_hi,
-                    cache_max_age=load_settings()["cache_max_age"]),
+                    cache_max_age=load_settings()["cache_max_age"],
+                    overlap=True),
         key=lambda e: e["start"],
     )
 

@@ -50,12 +50,9 @@ Item {
     // Events overlapping a given local day, all-day first then by start time.
     function eventsForDay(day) {
         if (!theme || !events) return [];
-        var ds = theme.startOfDay(day);
-        var de = theme.addDays(ds, 1);
         var out = [];
         for (var i = 0; i < events.length; i++) {
-            var ev = events[i];
-            if (ev._end > ds && ev._start < de) out.push(ev);
+            if (theme.eventCoversDay(events[i], day)) out.push(events[i]);
         }
         out.sort(function(a, b) {
             var aa = a.all_day === true ? 0 : 1;
@@ -135,9 +132,11 @@ Item {
                 // Days spilling in from the adjacent months get a distinctly grey
                 // fill (and dimmed content below) so their events read clearly as
                 // belonging to another month, not the one on display.
-                color: !inMonth ? month.outOfMonthBg
-                     : isToday   ? theme.todayTint
-                     :             theme.card
+                property color allDayTint: theme.dayTint(cellDate)
+                color: !inMonth            ? month.outOfMonthBg
+                     : allDayTint.a > 0    ? allDayTint
+                     : isToday             ? theme.todayTint
+                     :                       theme.card
                 border.width: 1
                 border.color: theme.border
 
